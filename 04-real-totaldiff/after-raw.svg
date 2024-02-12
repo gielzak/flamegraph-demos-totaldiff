@@ -1,0 +1,2673 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1800" height="1803" onload="init(evt)" viewBox="0 0 1800 1803" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#f8f8f8" offset="5%" />
+		<stop stop-color="#e8e8e8" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Roboto, sans-serif; font-size:13px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:18px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+
+		// use GET parameters to restore a flamegraphs state.
+		var params = get_params();
+		if (params.x && params.y)
+			zoom(find_group(document.querySelector('[x="' + params.x + '"][y="' + params.y + '"]')));
+                if (params.s) search(params.s);
+	}
+
+	// event listeners
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom(true);
+			zoom(target);
+			if (!document.querySelector('.parent')) {
+				// we have basically done a clearzoom so clear the url
+				var params = get_params();
+				if (params.x) delete params.x;
+				if (params.y) delete params.y;
+				history.replaceState(null, null, parse_params(params));
+				unzoombtn.classList.add("hide");
+				return;
+			}
+
+			// set parameters for zoom state
+			var el = target.querySelector("rect");
+			if (el && el.attributes && el.attributes.y && el.attributes._orig_x) {
+				var params = get_params()
+				params.x = el.attributes._orig_x.value;
+				params.y = el.attributes.y.value;
+				history.replaceState(null, null, parse_params(params));
+			}
+		}
+		else if (e.target.id == "unzoom") clearzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+		else if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function get_params() {
+		var params = {};
+		var paramsarr = window.location.search.substr(1).split('&');
+		for (var i = 0; i < paramsarr.length; ++i) {
+			var tmp = paramsarr[i].split("=");
+			if (!tmp[0] || !tmp[1]) continue;
+			params[tmp[0]]  = decodeURIComponent(tmp[1]);
+		}
+		return params;
+	}
+	function parse_params(params) {
+		var uri = "?";
+		for (var key in params) {
+			uri += key + '=' + encodeURIComponent(params[key]) + '&';
+		}
+		if (uri.slice(-1) == "&")
+			uri = uri.substring(0, uri.length - 1);
+		if (uri == '?')
+			uri = window.location.href.split('?')[0];
+		return uri;
+	}
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 13 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		var sl = t.getSubStringLength(0, txt.length);
+		// check if only whitespace or if we can fit the entire string into width w
+		if (/^ *$/.test(txt) || sl < w)
+			return;
+
+		// this isn't perfect, but gives a good starting point
+		// and avoids calling getSubStringLength too often
+		var start = Math.floor((w/sl) * txt.length);
+		for (var x = start; x > 0; x = x-2) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (1 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom(dont_update_text) {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			if(!dont_update_text) update_text(el[i]);
+		}
+		search();
+	}
+	function clearzoom() {
+		unzoom();
+
+		// remove zoom state
+		var params = get_params();
+		if (params.x) delete params.x;
+		if (params.y) delete params.y;
+		history.replaceState(null, null, parse_params(params));
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+		var params = get_params();
+		delete params.s;
+		history.replaceState(null, null, parse_params(params));
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) search(term);
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (term) currentSearchTerm = term;
+
+		var re = new RegExp(currentSearchTerm, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+		var params = get_params();
+		params.s = currentSearchTerm;
+		history.replaceState(null, null, parse_params(params));
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1800.0" height="1803.0" fill="url(#background)"  />
+<text id="title" x="900.00" y="26" >current graph</text>
+<text id="details" x="10.00" y="1785" > </text>
+<text id="unzoom" x="10.00" y="26" class="hide">Reset Zoom</text>
+<text id="search" x="1690.00" y="26" >Search</text>
+<text id="ignorecase" x="1774.00" y="26" >ic</text>
+<text id="matched" x="1690.00" y="1785" > </text>
+<g id="frames">
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate$layoutChildrenBlock$1.invoke (429,419,051 ns, 8.67%)</title><rect x="233.3" y="1495" width="154.3" height="15.0" fill="rgb(201,52,52)" rx="2" ry="2" />
+<text  x="236.28" y="1505.5" >androidx.compose.u..</text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.Placeable$PlacementScope.placeRelative (518,924,947 ns, 10.47%)</title><rect x="208.5" y="1127" width="186.5" height="15.0" fill="rgb(250,123,123)" rx="2" ry="2" />
+<text  x="211.54" y="1137.5" >androidx.compose.ui.la..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNode.dispatchOnPositionedCallbacks$ui_release (6,885,069 ns, 0.14%)</title><rect x="892.8" y="919" width="2.4" height="15.0" fill="rgb(202,53,53)" rx="2" ry="2" />
+<text  x="895.76" y="929.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.Placeable$PlacementScope.placeWithLayer (509,089,134 ns, 10.28%)</title><rect x="212.1" y="1207" width="182.9" height="15.0" fill="rgb(249,121,121)" rx="2" ry="2" />
+<text  x="215.08" y="1217.5" >androidx.compose.ui.l..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListMeasuredItem.place (325,159,432 ns, 6.56%)</title><rect x="250.6" y="1591" width="116.8" height="15.0" fill="rgb(254,129,129)" rx="2" ry="2" />
+<text  x="253.60" y="1601.5" >androidx.comp..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.tryFinalizeSimpleState (5,901,487 ns, 0.12%)</title><rect x="1149.8" y="823" width="2.1" height="15.0" fill="rgb(222,83,83)" rx="2" ry="2" />
+<text  x="1152.82" y="833.5" ></text>
+</g>
+<g >
+<title>PaletteTraceIntegerValue (20,621,499 ns, 0.42%)</title><rect x="615.5" y="1399" width="7.4" height="15.0" fill="rgb(243,113,113)" rx="2" ry="2" />
+<text  x="618.49" y="1409.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.CancellableContinuationImpl.&lt;init&gt; (9,835,813 ns, 0.20%)</title><rect x="1300.8" y="727" width="3.5" height="15.0" fill="rgb(247,119,119)" rx="2" ry="2" />
+<text  x="1303.78" y="737.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$ObservedScopeMap.recordInvalidation (54,553,979 ns, 1.10%)</title><rect x="1506.0" y="599" width="19.6" height="15.0" fill="rgb(221,81,81)" rx="2" ry="2" />
+<text  x="1508.96" y="609.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutModifierNodeCoordinator.placeAt-f8xVGno (499,677,906 ns, 10.09%)</title><rect x="1590.7" y="695" width="179.5" height="15.0" fill="rgb(221,80,80)" rx="2" ry="2" />
+<text  x="1593.71" y="705.5" >androidx.compose.ui.n..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.OnPositionedDispatcher.dispatchHierarchy (19,671,626 ns, 0.40%)</title><rect x="889.2" y="903" width="7.1" height="15.0" fill="rgb(226,88,88)" rx="2" ry="2" />
+<text  x="892.23" y="913.5" ></text>
+</g>
+<g >
+<title>[DEDUPED] (94,753,408 ns, 1.91%)</title><rect x="799.7" y="1303" width="34.0" height="15.0" fill="rgb(249,121,121)" rx="2" ry="2" />
+<text  x="802.65" y="1313.5" >[D..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.Recomposer.getHasPendingWork (21,638,789 ns, 0.44%)</title><rect x="55.6" y="551" width="7.8" height="15.0" fill="rgb(251,124,124)" rx="2" ry="2" />
+<text  x="58.59" y="561.5" ></text>
+</g>
+<g >
+<title>__libc_init (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="71" width="1779.3" height="15.0" fill="rgb(202,53,53)" rx="2" ry="2" />
+<text  x="13.00" y="81.5" >__libc_init</text>
+</g>
+<g >
+<title>art::JValue art::InvokeWithVarArgs&lt;_jmethodID*&gt;(art::ScopedObjectAccessAlreadyRunnable const&amp;, _jobject*, _jmethodID*, std::__va_list) (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="151" width="1779.3" height="15.0" fill="rgb(210,210,62)" rx="2" ry="2" />
+<text  x="13.00" y="161.5" >art::JValue art::InvokeWithVarArgs&lt;_jmethodID*&gt;(art::ScopedObjectAccessAlreadyRunnable const&amp;, _jobject*, _jmethodID*, std::__va_list)</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotKt.readable (20,219,665 ns, 0.41%)</title><rect x="1742.1" y="1287" width="7.3" height="15.0" fill="rgb(246,117,117)" rx="2" ry="2" />
+<text  x="1745.09" y="1297.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.AndroidOverscroll_androidKt$StretchOverscrollNonClippingLayer$2.invoke-3p2s80s (1,137,580,312 ns, 22.96%)</title><rect x="458.1" y="1223" width="408.8" height="15.0" fill="rgb(233,98,98)" rx="2" ry="2" />
+<text  x="461.14" y="1233.5" >androidx.compose.foundation.AndroidOverscroll_andro..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.intrinsics.UndispatchedKt.startUndispatchedOrReturn (2,240,029,409 ns, 45.21%)</title><rect x="144.2" y="759" width="804.8" height="15.0" fill="rgb(246,117,117)" rx="2" ry="2" />
+<text  x="147.23" y="769.5" >kotlinx.coroutines.intrinsics.UndispatchedKt.startUndispatchedOrReturn</text>
+</g>
+<g >
+<title>androidx.compose.runtime.SnapshotMutableIntStateImpl.setIntValue (16,842,242 ns, 0.34%)</title><rect x="1114.2" y="967" width="6.1" height="15.0" fill="rgb(203,55,55)" rx="2" ry="2" />
+<text  x="1117.21" y="977.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.layout.LazyLayoutMeasureScopeImpl.measure-0kLqBqw (328,061,401 ns, 6.62%)</title><rect x="623.7" y="1351" width="117.9" height="15.0" fill="rgb(203,55,55)" rx="2" ry="2" />
+<text  x="626.69" y="1361.5" >androidx.comp..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.CoroutineScopeKt.coroutineScope (2,256,750,290 ns, 45.55%)</title><rect x="138.2" y="743" width="810.8" height="15.0" fill="rgb(222,83,83)" rx="2" ry="2" />
+<text  x="141.22" y="753.5" >kotlinx.coroutines.CoroutineScopeKt.coroutineScope</text>
+</g>
+<g >
+<title>androidx.compose.runtime.SnapshotMutableIntStateImpl.getIntValue (6,885,069 ns, 0.14%)</title><rect x="783.3" y="1335" width="2.5" height="15.0" fill="rgb(233,99,99)" rx="2" ry="2" />
+<text  x="786.28" y="1345.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.NodeCoordinator.onMeasured (54,089,645 ns, 1.09%)</title><rect x="843.2" y="1255" width="19.4" height="15.0" fill="rgb(205,58,58)" rx="2" ry="2" />
+<text  x="846.19" y="1265.5" ></text>
+</g>
+<g >
+<title>kotlin.coroutines.CombinedContext.fold (7,868,651 ns, 0.16%)</title><rect x="1186.8" y="679" width="2.8" height="15.0" fill="rgb(247,118,118)" rx="2" ry="2" />
+<text  x="1189.78" y="689.5" ></text>
+</g>
+<g >
+<title>androidx.compose.testutils.benchmark.ComposeBenchmarkRule$measureRepeatedOnUiThread$$inlined$measureRepeatedOnMainThread$1.call (4,947,410,068 ns, 99.86%)</title><rect x="10.0" y="455" width="1777.6" height="15.0" fill="rgb(218,76,76)" rx="2" ry="2" />
+<text  x="13.00" y="465.5" >androidx.compose.testutils.benchmark.ComposeBenchmarkRule$measureRepeatedOnUiThread$$inlined$measureRepeatedOnMainThread$1.call</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$ObservedScopeMap.observe (528,201,764 ns, 10.66%)</title><rect x="1581.5" y="631" width="189.8" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="1584.52" y="641.5" >androidx.compose.runti..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.NodeCoordinator.updateLayerBlock (8,002,100 ns, 0.16%)</title><rect x="320.5" y="1687" width="2.9" height="15.0" fill="rgb(232,96,96)" rx="2" ry="2" />
+<text  x="323.51" y="1697.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LookaheadCapablePlaceable$layout$1.placeChildren (479,875,801 ns, 9.69%)</title><rect x="1595.0" y="711" width="172.4" height="15.0" fill="rgb(231,96,96)" rx="2" ry="2" />
+<text  x="1597.95" y="721.5" >androidx.compose.ui...</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate$placeOuterCoordinatorBlock$1.invoke (507,546,557 ns, 10.24%)</title><rect x="1587.9" y="663" width="182.3" height="15.0" fill="rgb(248,119,119)" rx="2" ry="2" />
+<text  x="1590.88" y="673.5" >androidx.compose.ui.n..</text>
+</g>
+<g >
+<title>unknown (11,802,976 ns, 0.24%)</title><rect x="608.1" y="1463" width="4.2" height="15.0" fill="rgb(248,120,120)" rx="2" ry="2" />
+<text  x="611.07" y="1473.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.platform.AndroidComposeView.measureAndLayoutForTest (634,428,547 ns, 12.81%)</title><rect x="1559.3" y="519" width="227.9" height="15.0" fill="rgb(234,100,100)" rx="2" ry="2" />
+<text  x="1562.26" y="529.5" >androidx.compose.ui.platfor..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.benchmark.lazy.ListRemeasureTestCase.afterToggle (5,901,488 ns, 0.12%)</title><rect x="66.5" y="519" width="2.2" height="15.0" fill="rgb(246,117,117)" rx="2" ry="2" />
+<text  x="69.54" y="529.5" ></text>
+</g>
+<g >
+<title>android.view.ViewGroup.onDescendantInvalidated (10,819,395 ns, 0.22%)</title><rect x="1729.7" y="1431" width="3.9" height="15.0" fill="rgb(236,103,103)" rx="2" ry="2" />
+<text  x="1732.73" y="1441.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.DerivedSnapshotState.current (10,819,394 ns, 0.22%)</title><rect x="823.3" y="1463" width="3.9" height="15.0" fill="rgb(211,66,66)" rx="2" ry="2" />
+<text  x="826.33" y="1473.5" ></text>
+</g>
+<g >
+<title>snprintf(char*, unsigned long pass_object_size1, char const*, ...) (5,901,488 ns, 0.12%)</title><rect x="616.2" y="1431" width="2.1" height="15.0" fill="rgb(221,80,80)" rx="2" ry="2" />
+<text  x="619.20" y="1441.5" ></text>
+</g>
+<g >
+<title>android.view.ViewGroup.onDescendantInvalidated (29,507,441 ns, 0.60%)</title><rect x="1723.0" y="1399" width="10.6" height="15.0" fill="rgb(236,103,103)" rx="2" ry="2" />
+<text  x="1726.01" y="1409.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.gestures.DefaultScrollableState.scroll (2,321,666,654 ns, 46.86%)</title><rect x="122.0" y="663" width="834.1" height="15.0" fill="rgb(213,70,70)" rx="2" ry="2" />
+<text  x="124.96" y="673.5" >androidx.compose.foundation.gestures.DefaultScrollableState.scroll</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.MutableSnapshot.recordModified$runtime_release (9,835,813 ns, 0.20%)</title><rect x="1135.7" y="887" width="3.5" height="15.0" fill="rgb(242,111,111)" rx="2" ry="2" />
+<text  x="1138.68" y="897.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListItemProviderImpl.getKey (7,868,650 ns, 0.16%)</title><rect x="593.2" y="1351" width="2.8" height="15.0" fill="rgb(223,83,83)" rx="2" ry="2" />
+<text  x="596.19" y="1361.5" ></text>
+</g>
+<g >
+<title>art_quick_alloc_array_resolved32_region_tlab (5,901,487 ns, 0.12%)</title><rect x="750.0" y="1383" width="2.1" height="15.0" fill="rgb(207,60,60)" rx="2" ry="2" />
+<text  x="753.03" y="1393.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.collection.IdentityArraySet.add (11,633,410 ns, 0.23%)</title><rect x="914.7" y="887" width="4.2" height="15.0" fill="rgb(207,61,61)" rx="2" ry="2" />
+<text  x="917.67" y="897.5" ></text>
+</g>
+<g >
+<title>kotlin.collections.ArrayDeque.addLast (17,704,463 ns, 0.36%)</title><rect x="746.1" y="1351" width="6.4" height="15.0" fill="rgb(223,84,84)" rx="2" ry="2" />
+<text  x="749.14" y="1361.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.AbstractCoroutine.&lt;init&gt; (13,770,137 ns, 0.28%)</title><rect x="139.3" y="775" width="4.9" height="15.0" fill="rgb(251,124,124)" rx="2" ry="2" />
+<text  x="142.28" y="785.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListScrollPosition.updateFromMeasureResult (11,802,975 ns, 0.24%)</title><rect x="757.8" y="1351" width="4.2" height="15.0" fill="rgb(240,108,108)" rx="2" ry="2" />
+<text  x="760.77" y="1361.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.AlignmentLines.onAlignmentsChanged (11,802,976 ns, 0.24%)</title><rect x="1695.7" y="1383" width="4.2" height="15.0" fill="rgb(202,53,53)" rx="2" ry="2" />
+<text  x="1698.67" y="1393.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.intrinsics.UndispatchedKt.startUndispatchedOrReturn (2,287,241,309 ns, 46.17%)</title><rect x="134.3" y="695" width="821.8" height="15.0" fill="rgb(246,117,117)" rx="2" ry="2" />
+<text  x="137.33" y="705.5" >kotlinx.coroutines.intrinsics.UndispatchedKt.startUndispatchedOrReturn</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.MutableSnapshot.recordModified$runtime_release (17,534,897 ns, 0.35%)</title><rect x="913.3" y="871" width="6.3" height="15.0" fill="rgb(242,111,111)" rx="2" ry="2" />
+<text  x="916.26" y="881.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.SnapshotMutableStateImpl.setValue (47,749,950 ns, 0.96%)</title><rect x="903.4" y="839" width="17.1" height="15.0" fill="rgb(217,76,76)" rx="2" ry="2" />
+<text  x="906.36" y="849.5" ></text>
+</g>
+<g >
+<title>all (4,954,213,839 ns, 100%)</title><rect x="10.0" y="39" width="1780.0" height="15.0" fill="rgb(209,63,63)" rx="2" ry="2" />
+<text  x="13.00" y="49.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.DispatchedTask.run (2,386,583,021 ns, 48.17%)</title><rect x="108.9" y="599" width="857.5" height="15.0" fill="rgb(224,85,85)" rx="2" ry="2" />
+<text  x="111.89" y="609.5" >kotlinx.coroutines.DispatchedTask.run</text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListMeasureKt$measureLazyList$7.invoke (371,387,754 ns, 7.50%)</title><rect x="243.5" y="1575" width="133.5" height="15.0" fill="rgb(230,93,93)" rx="2" ry="2" />
+<text  x="246.53" y="1585.5" >androidx.compos..</text>
+</g>
+<g >
+<title>java.util.concurrent.FutureTask.run (4,947,410,068 ns, 99.86%)</title><rect x="10.0" y="407" width="1777.6" height="15.0" fill="rgb(235,102,102)" rx="2" ry="2" />
+<text  x="13.00" y="417.5" >java.util.concurrent.FutureTask.run</text>
+</g>
+<g >
+<title>kotlin.coroutines.intrinsics.IntrinsicsKt__IntrinsicsJvmKt.intercepted (27,540,277 ns, 0.56%)</title><rect x="983.0" y="615" width="9.9" height="15.0" fill="rgb(209,63,63)" rx="2" ry="2" />
+<text  x="985.97" y="625.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.benchmark.lazy.ListRemeasureTestCase$toggle$1.create (5,901,487 ns, 0.12%)</title><rect x="1180.1" y="631" width="2.1" height="15.0" fill="rgb(222,83,83)" rx="2" ry="2" />
+<text  x="1183.07" y="641.5" ></text>
+</g>
+<g >
+<title>art_quick_invoke_static_stub (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="311" width="1779.3" height="15.0" fill="rgb(219,78,78)" rx="2" ry="2" />
+<text  x="13.00" y="321.5" >art_quick_invoke_static_stub</text>
+</g>
+<g >
+<title>androidx.compose.ui.platform.AndroidComposeView.measureAndLayout (633,444,966 ns, 12.79%)</title><rect x="1559.6" y="535" width="227.6" height="15.0" fill="rgb(227,89,89)" rx="2" ry="2" />
+<text  x="1562.61" y="545.5" >androidx.compose.ui.platfor..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.CompositionImpl.getHasInvalidations (14,876,923 ns, 0.30%)</title><rect x="680.0" y="1415" width="5.3" height="15.0" fill="rgb(214,70,70)" rx="2" ry="2" />
+<text  x="682.97" y="1425.5" ></text>
+</g>
+<g >
+<title>kotlin.coroutines.CoroutineContext$plus$1.invoke (8,852,232 ns, 0.18%)</title><rect x="126.9" y="759" width="3.2" height="15.0" fill="rgb(225,87,87)" rx="2" ry="2" />
+<text  x="129.91" y="769.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LookaheadCapablePlaceable$layout$1.placeChildren (458,237,013 ns, 9.25%)</title><rect x="1598.8" y="919" width="164.7" height="15.0" fill="rgb(231,96,96)" rx="2" ry="2" />
+<text  x="1601.84" y="929.5" >androidx.compose.ui..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotKt.overwritableRecord (22,452,803 ns, 0.45%)</title><rect x="911.8" y="855" width="8.1" height="15.0" fill="rgb(234,100,100)" rx="2" ry="2" />
+<text  x="914.85" y="865.5" ></text>
+</g>
+<g >
+<title>[DEDUPED] ?.placeChildren (337,302,103 ns, 6.81%)</title><rect x="1628.2" y="1207" width="121.2" height="15.0" fill="rgb(219,78,78)" rx="2" ry="2" />
+<text  x="1631.17" y="1217.5" >[DEDUPED] ?.p..</text>
+</g>
+<g >
+<title>android.app.Instrumentation$SyncRunnable.run (4,947,410,068 ns, 99.86%)</title><rect x="10.0" y="391" width="1777.6" height="15.0" fill="rgb(252,126,126)" rx="2" ry="2" />
+<text  x="13.00" y="401.5" >android.app.Instrumentation$SyncRunnable.run</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$ObservedScopeMap.recordRead (5,901,488 ns, 0.12%)</title><rect x="839.0" y="1367" width="2.1" height="15.0" fill="rgb(243,113,113)" rx="2" ry="2" />
+<text  x="842.00" y="1377.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotKt.trackPinning (7,868,650 ns, 0.16%)</title><rect x="1485.6" y="599" width="2.9" height="15.0" fill="rgb(200,50,50)" rx="2" ry="2" />
+<text  x="1488.62" y="609.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.fold (7,017,595 ns, 0.14%)</title><rect x="1009.3" y="583" width="2.5" height="15.0" fill="rgb(209,64,64)" rx="2" ry="2" />
+<text  x="1012.30" y="593.5" ></text>
+</g>
+<g >
+<title>[DEDUPED] ?.get (9,835,812 ns, 0.20%)</title><rect x="509.7" y="1335" width="3.6" height="15.0" fill="rgb(218,76,76)" rx="2" ry="2" />
+<text  x="512.73" y="1345.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.sync.MutexImpl.tryLock (5,901,488 ns, 0.12%)</title><rect x="923.3" y="823" width="2.1" height="15.0" fill="rgb(247,119,119)" rx="2" ry="2" />
+<text  x="926.28" y="833.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.CoroutineDispatcher.interceptContinuation (24,589,533 ns, 0.50%)</title><rect x="984.0" y="647" width="8.9" height="15.0" fill="rgb(211,66,66)" rx="2" ry="2" />
+<text  x="987.03" y="657.5" ></text>
+</g>
+<g >
+<title>art_jni_trampoline (6,885,069 ns, 0.14%)</title><rect x="916.1" y="919" width="2.5" height="15.0" fill="rgb(254,128,128)" rx="2" ry="2" />
+<text  x="919.09" y="929.5" ></text>
+</g>
+<g >
+<title>kotlin.coroutines.CoroutineContext$plus$1.invoke (5,901,488 ns, 0.12%)</title><rect x="82.4" y="615" width="2.2" height="15.0" fill="rgb(225,87,87)" rx="2" ry="2" />
+<text  x="85.44" y="625.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.AbstractCoroutine.&lt;init&gt; (26,556,695 ns, 0.54%)</title><rect x="124.8" y="711" width="9.5" height="15.0" fill="rgb(251,124,124)" rx="2" ry="2" />
+<text  x="127.79" y="721.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LookaheadCapablePlaceable$layout$1.placeChildren (516,957,785 ns, 10.43%)</title><rect x="209.3" y="1159" width="185.7" height="15.0" fill="rgb(231,96,96)" rx="2" ry="2" />
+<text  x="212.25" y="1169.5" >androidx.compose.ui.no..</text>
+</g>
+<g >
+<title>kotlin.coroutines.intrinsics.IntrinsicsKt__IntrinsicsJvmKt.intercepted (22,210,035 ns, 0.45%)</title><rect x="1182.2" y="615" width="8.0" height="15.0" fill="rgb(209,63,63)" rx="2" ry="2" />
+<text  x="1185.19" y="625.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.SnapshotMutableStateImpl.getValue (20,655,208 ns, 0.42%)</title><rect x="833.7" y="1303" width="7.4" height="15.0" fill="rgb(248,120,120)" rx="2" ry="2" />
+<text  x="836.70" y="1313.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.placeOuterCoordinator-f8xVGno (575,879,735 ns, 11.62%)</title><rect x="191.6" y="919" width="206.9" height="15.0" fill="rgb(233,98,98)" rx="2" ry="2" />
+<text  x="194.58" y="929.5" >androidx.compose.ui.node..</text>
+</g>
+<g >
+<title>System_nanoTime (7,868,650 ns, 0.16%)</title><rect x="42.5" y="535" width="2.8" height="15.0" fill="rgb(239,107,107)" rx="2" ry="2" />
+<text  x="45.51" y="545.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.EventLoopImplBase.enqueueImpl (6,885,069 ns, 0.14%)</title><rect x="1193.0" y="663" width="2.5" height="15.0" fill="rgb(230,94,94)" rx="2" ry="2" />
+<text  x="1195.99" y="673.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutModifierNodeCoordinator.placeAt-f8xVGno (517,941,366 ns, 10.45%)</title><rect x="208.9" y="1143" width="186.1" height="15.0" fill="rgb(221,80,80)" rx="2" ry="2" />
+<text  x="211.90" y="1153.5" >androidx.compose.ui.no..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.NodeCoordinator.onMeasured (9,463,126 ns, 0.19%)</title><rect x="874.6" y="1095" width="3.4" height="15.0" fill="rgb(205,58,58)" rx="2" ry="2" />
+<text  x="877.64" y="1105.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.NodeCoordinator.onMeasured (7,868,650 ns, 0.16%)</title><rect x="879.8" y="1063" width="2.8" height="15.0" fill="rgb(205,58,58)" rx="2" ry="2" />
+<text  x="882.80" y="1073.5" ></text>
+</g>
+<g >
+<title>kotlin.coroutines.CoroutineContext$plus$1.invoke (5,901,488 ns, 0.12%)</title><rect x="128.0" y="775" width="2.1" height="15.0" fill="rgb(225,87,87)" rx="2" ry="2" />
+<text  x="130.97" y="785.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotKt.readable (20,655,208 ns, 0.42%)</title><rect x="369.5" y="1607" width="7.5" height="15.0" fill="rgb(246,117,117)" rx="2" ry="2" />
+<text  x="372.54" y="1617.5" ></text>
+</g>
+<g >
+<title>[DEDUPED] ?.call (4,939,541,417 ns, 99.70%)</title><rect x="12.8" y="471" width="1774.8" height="15.0" fill="rgb(224,85,85)" rx="2" ry="2" />
+<text  x="15.83" y="481.5" >[DEDUPED] ?.call</text>
+</g>
+<g >
+<title>kotlin.collections.CollectionsKt___CollectionsKt.getOrNull (9,835,813 ns, 0.20%)</title><rect x="689.9" y="1399" width="3.5" height="15.0" fill="rgb(235,102,102)" rx="2" ry="2" />
+<text  x="692.91" y="1409.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.graphics.SimpleGraphicsLayerModifier$measure$1.invoke (461,187,756 ns, 9.31%)</title><rect x="1598.5" y="855" width="165.7" height="15.0" fill="rgb(237,105,105)" rx="2" ry="2" />
+<text  x="1601.48" y="865.5" >androidx.compose.ui..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.tryMakeCompleting (9,835,812 ns, 0.20%)</title><rect x="952.6" y="727" width="3.5" height="15.0" fill="rgb(213,69,69)" rx="2" ry="2" />
+<text  x="955.58" y="737.5" ></text>
+</g>
+<g >
+<title>androidx.collection.ScatterMap.get (9,662,765 ns, 0.20%)</title><rect x="1452.9" y="791" width="3.5" height="15.0" fill="rgb(229,93,93)" rx="2" ry="2" />
+<text  x="1455.92" y="801.5" ></text>
+</g>
+<g >
+<title>android.view.ViewGroup.onDescendantInvalidated (27,540,277 ns, 0.56%)</title><rect x="346.0" y="1719" width="9.9" height="15.0" fill="rgb(236,103,103)" rx="2" ry="2" />
+<text  x="349.01" y="1729.5" ></text>
+</g>
+<g >
+<title>kotlin.coroutines.CoroutineContext$plus$1.invoke (6,885,068 ns, 0.14%)</title><rect x="1054.8" y="775" width="2.5" height="15.0" fill="rgb(225,87,87)" rx="2" ry="2" />
+<text  x="1057.84" y="785.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotKt.createTransparentSnapshotWithNoParentReadObserver (6,885,069 ns, 0.14%)</title><rect x="793.3" y="1335" width="2.5" height="15.0" fill="rgb(216,74,74)" rx="2" ry="2" />
+<text  x="796.29" y="1345.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver.drainChanges (84,061,418 ns, 1.70%)</title><rect x="1495.7" y="583" width="30.2" height="15.0" fill="rgb(207,60,60)" rx="2" ry="2" />
+<text  x="1498.71" y="593.5" >a..</text>
+</g>
+<g >
+<title>art::Method_invoke(_JNIEnv*, _jobject*, _jobject*, _jobjectArray*) (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="263" width="1779.3" height="15.0" fill="rgb(224,224,68)" rx="2" ry="2" />
+<text  x="13.00" y="273.5" >art::Method_invoke(_JNIEnv*, _jobject*, _jobject*, _jobjectArray*)</text>
+</g>
+<g >
+<title>[DEDUPED] ?.placeChildren (383,190,730 ns, 7.73%)</title><rect x="239.3" y="1527" width="137.7" height="15.0" fill="rgb(219,78,78)" rx="2" ry="2" />
+<text  x="242.29" y="1537.5" >[DEDUPED] ?.pla..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.layoutChildren (463,844,397 ns, 9.36%)</title><rect x="222.7" y="1415" width="166.6" height="15.0" fill="rgb(218,76,76)" rx="2" ry="2" />
+<text  x="225.68" y="1425.5" >androidx.compose.ui..</text>
+</g>
+<g >
+<title>System_nanoTime (15,737,301 ns, 0.32%)</title><rect x="99.7" y="631" width="5.7" height="15.0" fill="rgb(239,107,107)" rx="2" ry="2" />
+<text  x="102.70" y="641.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.AbstractCoroutine.&lt;init&gt; (10,819,393 ns, 0.22%)</title><rect x="1068.6" y="791" width="3.9" height="15.0" fill="rgb(251,124,124)" rx="2" ry="2" />
+<text  x="1071.62" y="801.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.completeStateFinalization (14,277,706 ns, 0.29%)</title><rect x="943.4" y="823" width="5.2" height="15.0" fill="rgb(216,73,73)" rx="2" ry="2" />
+<text  x="946.43" y="833.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.OnPositionedDispatcher.dispatch (33,441,764 ns, 0.68%)</title><rect x="885.7" y="887" width="12.0" height="15.0" fill="rgb(213,69,69)" rx="2" ry="2" />
+<text  x="888.70" y="897.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.MutatorMutex$mutateWith$2.invoke (2,188,975,955 ns, 44.18%)</title><rect x="148.8" y="775" width="786.5" height="15.0" fill="rgb(206,59,59)" rx="2" ry="2" />
+<text  x="151.82" y="785.5" >androidx.compose.foundation.MutatorMutex$mutateWith$2.invoke</text>
+</g>
+<g >
+<title>androidx.compose.ui.test.FrameDeferringContinuationInterceptor$FrameDeferredContinuation.resumeWith (585,649,267 ns, 11.82%)</title><rect x="1262.6" y="663" width="210.4" height="15.0" fill="rgb(215,72,72)" rx="2" ry="2" />
+<text  x="1265.61" y="673.5" >androidx.compose.ui.test...</text>
+</g>
+<g >
+<title>kotlinx.coroutines.intrinsics.CancellableKt.startCoroutineCancellable$default (48,766,729 ns, 0.98%)</title><rect x="1177.9" y="583" width="17.6" height="15.0" fill="rgb(246,117,117)" rx="2" ry="2" />
+<text  x="1180.95" y="593.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.benchmark.lazy.LazyBenchmarkCommonKt$toggleStateBenchmark$1$2.invoke (4,911,017,559 ns, 99.13%)</title><rect x="23.1" y="503" width="1764.5" height="15.0" fill="rgb(230,93,93)" rx="2" ry="2" />
+<text  x="26.08" y="513.5" >androidx.compose.foundation.benchmark.lazy.LazyBenchmarkCommonKt$toggleStateBenchmark$1$2.invoke</text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.fold (6,885,068 ns, 0.14%)</title><rect x="1054.8" y="759" width="2.5" height="15.0" fill="rgb(209,64,64)" rx="2" ry="2" />
+<text  x="1057.84" y="769.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LookaheadCapablePlaceable.roundToPx-0680j_4 (6,885,069 ns, 0.14%)</title><rect x="433.8" y="1063" width="2.4" height="15.0" fill="rgb(234,100,100)" rx="2" ry="2" />
+<text  x="436.76" y="1073.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.MeasureAndLayoutDelegate.forceMeasureTheSubtree (7,868,651 ns, 0.16%)</title><rect x="718.7" y="1415" width="2.8" height="15.0" fill="rgb(234,100,100)" rx="2" ry="2" />
+<text  x="721.72" y="1425.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutModifierNodeCoordinator.measure-BRTryo0 (1,196,595,185 ns, 24.15%)</title><rect x="444.7" y="1111" width="429.9" height="15.0" fill="rgb(201,52,52)" rx="2" ry="2" />
+<text  x="447.71" y="1121.5" >androidx.compose.ui.node.LayoutModifierNodeCoordinator..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListKt$rememberLazyListMeasurePolicy$1$1$measuredItemProvider$1.createItem (77,012,824 ns, 1.55%)</title><rect x="596.0" y="1351" width="27.7" height="15.0" fill="rgb(245,116,116)" rx="2" ry="2" />
+<text  x="599.02" y="1361.5" >a..</text>
+</g>
+<g >
+<title>androidx.compose.ui.graphics.SimpleGraphicsLayerModifier.measure-3p2s80s (1,198,562,348 ns, 24.19%)</title><rect x="444.0" y="1095" width="430.6" height="15.0" fill="rgb(204,55,55)" rx="2" ry="2" />
+<text  x="447.00" y="1105.5" >androidx.compose.ui.graphics.SimpleGraphicsLayerModifi..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.CoroutineStart.invoke (51,717,473 ns, 1.04%)</title><rect x="1176.9" y="567" width="18.6" height="15.0" fill="rgb(242,112,112)" rx="2" ry="2" />
+<text  x="1179.89" y="577.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListState.applyMeasureResult$foundation_release (29,628,798 ns, 0.60%)</title><rect x="1112.4" y="935" width="10.7" height="15.0" fill="rgb(244,115,115)" rx="2" ry="2" />
+<text  x="1115.44" y="945.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutModifierNodeCoordinator.placeAt-f8xVGno (468,072,825 ns, 9.45%)</title><rect x="1598.1" y="823" width="168.2" height="15.0" fill="rgb(221,80,80)" rx="2" ry="2" />
+<text  x="1601.13" y="833.5" >androidx.compose.ui..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotKt.overwritableRecord (10,940,754 ns, 0.22%)</title><rect x="1116.0" y="983" width="3.9" height="15.0" fill="rgb(234,100,100)" rx="2" ry="2" />
+<text  x="1118.98" y="993.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListKt$rememberLazyListMeasurePolicy$1$1.invoke (877,741,544 ns, 17.72%)</title><rect x="483.6" y="1287" width="315.3" height="15.0" fill="rgb(238,106,106)" rx="2" ry="2" />
+<text  x="486.58" y="1297.5" >androidx.compose.foundation.lazy.LazyLi..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.CancellableContinuationImpl.installParentHandle (29,606,257 ns, 0.60%)</title><rect x="1308.4" y="743" width="10.7" height="15.0" fill="rgb(204,56,56)" rx="2" ry="2" />
+<text  x="1311.45" y="753.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$readObserver$1.invoke (11,802,976 ns, 0.24%)</title><rect x="371.0" y="1639" width="4.2" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="373.96" y="1649.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.EventLoopImplBase.shutdown (17,440,381 ns, 0.35%)</title><rect x="1016.1" y="599" width="6.2" height="15.0" fill="rgb(224,85,85)" rx="2" ry="2" />
+<text  x="1019.06" y="609.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListKt$rememberLazyListMeasurePolicy$1$1.invoke-0kLqBqw (858,069,918 ns, 17.32%)</title><rect x="490.7" y="1303" width="308.2" height="15.0" fill="rgb(252,125,125)" rx="2" ry="2" />
+<text  x="493.65" y="1313.5" >androidx.compose.foundation.lazy.LazyL..</text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.LayoutNodeSubcompositionsState$Scope.subcompose (91,895,028 ns, 1.85%)</title><rect x="660.5" y="1367" width="33.0" height="15.0" fill="rgb(252,126,126)" rx="2" ry="2" />
+<text  x="663.53" y="1377.5" >an..</text>
+</g>
+<g >
+<title>java.lang.ThreadLocal.set (6,301,120 ns, 0.13%)</title><rect x="94.3" y="615" width="2.2" height="15.0" fill="rgb(226,88,88)" rx="2" ry="2" />
+<text  x="97.26" y="625.5" ></text>
+</g>
+<g >
+<title>java.util.ArrayList.&lt;init&gt; (6,087,497 ns, 0.12%)</title><rect x="727.5" y="1367" width="2.2" height="15.0" fill="rgb(220,79,79)" rx="2" ry="2" />
+<text  x="730.48" y="1377.5" ></text>
+</g>
+<g >
+<title>kotlin.collections.ArrayDeque.ensureCapacity (6,885,068 ns, 0.14%)</title><rect x="750.0" y="1367" width="2.5" height="15.0" fill="rgb(245,115,115)" rx="2" ry="2" />
+<text  x="753.03" y="1377.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.CompositionImpl.drainPendingModificationsLocked (303,809,881 ns, 6.13%)</title><rect x="1352.3" y="743" width="109.2" height="15.0" fill="rgb(229,93,93)" rx="2" ry="2" />
+<text  x="1355.30" y="753.5" >androidx.com..</text>
+</g>
+<g >
+<title>android.view.accessibility.AccessibilityManager.isEnabled (12,786,557 ns, 0.26%)</title><rect x="1709.4" y="1383" width="4.6" height="15.0" fill="rgb(226,88,88)" rx="2" ry="2" />
+<text  x="1712.45" y="1393.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.layout.LazyLayoutItemContentFactory.getContent (13,614,047 ns, 0.27%)</title><rect x="654.4" y="1367" width="4.9" height="15.0" fill="rgb(200,50,50)" rx="2" ry="2" />
+<text  x="657.44" y="1377.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.sync.MutexImpl.unlock (13,770,139 ns, 0.28%)</title><rect x="1142.0" y="823" width="5.0" height="15.0" fill="rgb(241,110,110)" rx="2" ry="2" />
+<text  x="1145.04" y="833.5" ></text>
+</g>
+<g >
+<title>_jobject* art::InvokeMethod&lt;(art::PointerSize)8&gt;(art::ScopedObjectAccessAlreadyRunnable const&amp;, _jobject*, _jobject*, _jobject*, unsigned long) (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="279" width="1779.3" height="15.0" fill="rgb(227,227,69)" rx="2" ry="2" />
+<text  x="13.00" y="289.5" >_jobject* art::InvokeMethod&lt;(art::PointerSize)8&gt;(art::ScopedObjectAccessAlreadyRunnable const&amp;, _jobject*, _jobject*, _jobject*, unsigned long)</text>
+</g>
+<g >
+<title>unknown (7,834,942 ns, 0.16%)</title><rect x="620.1" y="1495" width="2.8" height="15.0" fill="rgb(248,120,120)" rx="2" ry="2" />
+<text  x="623.09" y="1505.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.flow.StateFlowImpl.getValue (8,852,232 ns, 0.18%)</title><rect x="1469.3" y="727" width="3.2" height="15.0" fill="rgb(207,61,61)" rx="2" ry="2" />
+<text  x="1472.32" y="737.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.CancellableContinuationImpl.resumeImpl (632,506,210 ns, 12.77%)</title><rect x="1247.8" y="615" width="227.2" height="15.0" fill="rgb(207,61,61)" rx="2" ry="2" />
+<text  x="1250.77" y="625.5" >kotlinx.coroutines.Cancella..</text>
+</g>
+<g >
+<title>androidx.compose.ui.platform.RenderNodeApi29.getLeft (14,753,720 ns, 0.30%)</title><rect x="355.9" y="1703" width="5.3" height="15.0" fill="rgb(215,71,71)" rx="2" ry="2" />
+<text  x="358.90" y="1713.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.CoroutineStart.invoke (63,932,787 ns, 1.29%)</title><rect x="973.1" y="567" width="22.9" height="15.0" fill="rgb(242,112,112)" rx="2" ry="2" />
+<text  x="976.08" y="577.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.gestures.DefaultScrollableState$scroll$2.invoke (249,585,494 ns, 5.04%)</title><rect x="1063.3" y="727" width="89.7" height="15.0" fill="rgb(214,70,70)" rx="2" ry="2" />
+<text  x="1066.32" y="737.5" >androidx...</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.layoutChildren (405,327,819 ns, 8.18%)</title><rect x="1611.9" y="1095" width="145.6" height="15.0" fill="rgb(218,76,76)" rx="2" ry="2" />
+<text  x="1614.91" y="1105.5" >androidx.compose..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListMeasuredItem.place (283,640,673 ns, 5.73%)</title><rect x="1639.8" y="1271" width="101.9" height="15.0" fill="rgb(254,129,129)" rx="2" ry="2" />
+<text  x="1642.83" y="1281.5" >androidx.co..</text>
+</g>
+<g >
+<title>art_quick_invoke_static_stub (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="199" width="1779.3" height="15.0" fill="rgb(219,78,78)" rx="2" ry="2" />
+<text  x="13.00" y="209.5" >art_quick_invoke_static_stub</text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.LayoutNodeSubcompositionsState$createMeasurePolicy$1$measure-3p2s80s$$inlined$createMeasureResult$2.placeChildren (344,187,173 ns, 6.95%)</title><rect x="1626.4" y="1191" width="123.7" height="15.0" fill="rgb(227,89,89)" rx="2" ry="2" />
+<text  x="1629.40" y="1201.5" >androidx.compo..</text>
+</g>
+<g >
+<title>unknown (5,867,779 ns, 0.12%)</title><rect x="620.8" y="1511" width="2.1" height="15.0" fill="rgb(248,120,120)" rx="2" ry="2" />
+<text  x="623.80" y="1521.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.MeasureAndLayoutDelegate.requestRemeasure (8,852,232 ns, 0.18%)</title><rect x="899.1" y="887" width="3.2" height="15.0" fill="rgb(211,66,66)" rx="2" ry="2" />
+<text  x="902.12" y="897.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.NodeCoordinator.placeSelf-f8xVGno (183,315,378 ns, 3.70%)</title><rect x="1675.5" y="1351" width="65.9" height="15.0" fill="rgb(232,97,97)" rx="2" ry="2" />
+<text  x="1678.52" y="1361.5" >androi..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutModifierNodeCoordinator.placeAt-f8xVGno (500,236,903 ns, 10.10%)</title><rect x="214.9" y="1319" width="179.7" height="15.0" fill="rgb(221,80,80)" rx="2" ry="2" />
+<text  x="217.91" y="1329.5" >androidx.compose.ui.n..</text>
+</g>
+<g >
+<title>[DEDUPED] (11,802,976 ns, 0.24%)</title><rect x="926.1" y="823" width="4.3" height="15.0" fill="rgb(249,121,121)" rx="2" ry="2" />
+<text  x="929.11" y="833.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNode.dispatchOnPositionedCallbacks$ui_release (14,753,720 ns, 0.30%)</title><rect x="1778.0" y="583" width="5.3" height="15.0" fill="rgb(202,53,53)" rx="2" ry="2" />
+<text  x="1781.01" y="593.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.Placeable$PlacementScope.placeWithLayer$default (460,204,175 ns, 9.29%)</title><rect x="1598.8" y="871" width="165.4" height="15.0" fill="rgb(228,90,90)" rx="2" ry="2" />
+<text  x="1601.84" y="881.5" >androidx.compose.ui..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.initParentJob (11,802,975 ns, 0.24%)</title><rect x="130.1" y="727" width="4.2" height="15.0" fill="rgb(245,116,116)" rx="2" ry="2" />
+<text  x="133.09" y="737.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$readObserver$1.invoke (12,351,015 ns, 0.25%)</title><rect x="1744.2" y="1319" width="4.5" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="1747.21" y="1329.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListState.scroll (2,329,535,304 ns, 47.02%)</title><rect x="121.3" y="647" width="836.9" height="15.0" fill="rgb(235,101,101)" rx="2" ry="2" />
+<text  x="124.26" y="657.5" >androidx.compose.foundation.lazy.LazyListState.scroll</text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.LayoutNodeSubcompositionsState$Scope$layout$1.placeChildren (337,302,103 ns, 6.81%)</title><rect x="1628.2" y="1223" width="121.2" height="15.0" fill="rgb(200,51,51)" rx="2" ry="2" />
+<text  x="1631.17" y="1233.5" >androidx.comp..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.BroadcastFrameClock.getHasAwaiters (8,852,232 ns, 0.18%)</title><rect x="1203.9" y="551" width="3.2" height="15.0" fill="rgb(214,70,70)" rx="2" ry="2" />
+<text  x="1206.95" y="561.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.benchmark.lazy.ListRemeasureTestCase$toggle$1.invokeSuspend (338,107,811 ns, 6.82%)</title><rect x="1036.8" y="631" width="121.5" height="15.0" fill="rgb(253,127,127)" rx="2" ry="2" />
+<text  x="1039.82" y="641.5" >androidx.comp..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.AndroidOverscroll_androidKt$StretchOverscrollNonClippingLayer$1$1.invoke (455,286,269 ns, 9.19%)</title><rect x="1599.9" y="951" width="163.6" height="15.0" fill="rgb(212,68,68)" rx="2" ry="2" />
+<text  x="1602.90" y="961.5" >androidx.compose.fo..</text>
+</g>
+<g >
+<title>art::ArtMethod::Invoke(art::Thread*, unsigned int*, unsigned int, art::JValue*, char const*) (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="183" width="1779.3" height="15.0" fill="rgb(186,186,54)" rx="2" ry="2" />
+<text  x="13.00" y="193.5" >art::ArtMethod::Invoke(art::Thread*, unsigned int*, unsigned int, art::JValue*, char const*)</text>
+</g>
+<g >
+<title>artAllocObjectFromCodeInitializedRegionTLAB (10,819,394 ns, 0.22%)</title><rect x="721.8" y="1383" width="3.9" height="15.0" fill="rgb(239,108,108)" rx="2" ry="2" />
+<text  x="724.83" y="1393.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.attachChild (7,868,651 ns, 0.16%)</title><rect x="1058.4" y="759" width="2.8" height="15.0" fill="rgb(242,111,111)" rx="2" ry="2" />
+<text  x="1061.38" y="769.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.EventLoopImplBase.enqueue (6,885,069 ns, 0.14%)</title><rect x="993.6" y="647" width="2.4" height="15.0" fill="rgb(227,89,89)" rx="2" ry="2" />
+<text  x="996.57" y="657.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.NodeCoordinator.onPlaced (13,565,942 ns, 0.27%)</title><rect x="1757.5" y="1079" width="4.9" height="15.0" fill="rgb(239,107,107)" rx="2" ry="2" />
+<text  x="1760.54" y="1089.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.BuildersKt__BuildersKt.runBlocking (2,569,360,094 ns, 51.86%)</title><rect x="74.7" y="551" width="923.1" height="15.0" fill="rgb(202,54,54)" rx="2" ry="2" />
+<text  x="77.67" y="561.5" >kotlinx.coroutines.BuildersKt__BuildersKt.runBlocking</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotKt.takeNewGlobalSnapshot (40,862,423 ns, 0.82%)</title><rect x="1477.9" y="567" width="14.6" height="15.0" fill="rgb(211,66,66)" rx="2" ry="2" />
+<text  x="1480.85" y="577.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.intrinsics.UndispatchedKt.startUndispatchedOrReturn (263,355,632 ns, 5.32%)</title><rect x="1061.6" y="711" width="94.6" height="15.0" fill="rgb(246,117,117)" rx="2" ry="2" />
+<text  x="1064.56" y="721.5" >kotlinx.co..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.Snapshot$Companion.observe (518,365,951 ns, 10.46%)</title><rect x="1584.0" y="647" width="186.2" height="15.0" fill="rgb(252,126,126)" rx="2" ry="2" />
+<text  x="1587.00" y="657.5" >androidx.compose.runti..</text>
+</g>
+<g >
+<title>main (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="87" width="1779.3" height="15.0" fill="rgb(242,112,112)" rx="2" ry="2" />
+<text  x="13.00" y="97.5" >main</text>
+</g>
+<g >
+<title>kotlinx.coroutines.internal.ScopeCoroutine.&lt;init&gt; (13,770,137 ns, 0.28%)</title><rect x="139.3" y="759" width="4.9" height="15.0" fill="rgb(217,75,75)" rx="2" ry="2" />
+<text  x="142.28" y="769.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$performMeasureBlock$1.invoke (1,288,679,141 ns, 26.01%)</title><rect x="420.7" y="999" width="463.0" height="15.0" fill="rgb(226,88,88)" rx="2" ry="2" />
+<text  x="423.68" y="1009.5" >androidx.compose.ui.node.LayoutNodeLayoutDelegate$performM..</text>
+</g>
+<g >
+<title>java.util.HashMap.get (9,835,813 ns, 0.20%)</title><rect x="685.3" y="1415" width="3.5" height="15.0" fill="rgb(216,73,73)" rx="2" ry="2" />
+<text  x="688.31" y="1425.5" ></text>
+</g>
+<g >
+<title>clock_gettime (6,885,069 ns, 0.14%)</title><rect x="42.9" y="551" width="2.4" height="15.0" fill="rgb(209,63,63)" rx="2" ry="2" />
+<text  x="45.87" y="561.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.onNodePlaced$ui_release (410,245,726 ns, 8.28%)</title><rect x="1610.1" y="1079" width="147.4" height="15.0" fill="rgb(203,55,55)" rx="2" ry="2" />
+<text  x="1613.15" y="1089.5" >androidx.compose...</text>
+</g>
+<g >
+<title>androidx.compose.ui.platform.RenderNodeLayer.move--gyyYBs (73,768,599 ns, 1.49%)</title><rect x="339.6" y="1687" width="26.5" height="15.0" fill="rgb(218,77,77)" rx="2" ry="2" />
+<text  x="342.64" y="1697.5" >a..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.OwnerSnapshotObserver$onCommitAffectingLayout$1.invoke (44,261,160 ns, 0.89%)</title><rect x="1541.1" y="663" width="15.9" height="15.0" fill="rgb(239,106,106)" rx="2" ry="2" />
+<text  x="1544.11" y="673.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.platform.AndroidComposeView.forceMeasureTheSubtree (15,737,302 ns, 0.32%)</title><rect x="715.9" y="1399" width="5.6" height="15.0" fill="rgb(246,117,117)" rx="2" ry="2" />
+<text  x="718.89" y="1409.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.layoutChildren (20,655,208 ns, 0.42%)</title><rect x="1668.1" y="1367" width="7.4" height="15.0" fill="rgb(218,76,76)" rx="2" ry="2" />
+<text  x="1671.10" y="1377.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate$placeOuterCoordinatorBlock$1.invoke (501,645,069 ns, 10.13%)</title><rect x="1590.0" y="679" width="180.2" height="15.0" fill="rgb(248,119,119)" rx="2" ry="2" />
+<text  x="1593.00" y="689.5" >androidx.compose.ui.n..</text>
+</g>
+<g >
+<title>unknown (11,769,267 ns, 0.24%)</title><rect x="618.7" y="1463" width="4.2" height="15.0" fill="rgb(248,120,120)" rx="2" ry="2" />
+<text  x="621.67" y="1473.5" ></text>
+</g>
+<g >
+<title>[DEDUPED] (9,835,812 ns, 0.20%)</title><rect x="509.7" y="1319" width="3.6" height="15.0" fill="rgb(249,121,121)" rx="2" ry="2" />
+<text  x="512.73" y="1329.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver.observeReads (572,928,991 ns, 11.56%)</title><rect x="192.6" y="935" width="205.9" height="15.0" fill="rgb(214,70,70)" rx="2" ry="2" />
+<text  x="195.64" y="945.5" >androidx.compose.runtime..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.completeStateFinalization (6,885,068 ns, 0.14%)</title><rect x="953.6" y="759" width="2.5" height="15.0" fill="rgb(216,73,73)" rx="2" ry="2" />
+<text  x="956.64" y="769.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.NodeCoordinator.onPlaced (6,530,519 ns, 0.13%)</title><rect x="1767.4" y="711" width="2.3" height="15.0" fill="rgb(239,107,107)" rx="2" ry="2" />
+<text  x="1770.37" y="721.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotKt.readable (15,737,301 ns, 0.32%)</title><rect x="835.5" y="1319" width="5.6" height="15.0" fill="rgb(246,117,117)" rx="2" ry="2" />
+<text  x="838.47" y="1329.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.Placeable$PlacementScope.place (444,466,876 ns, 8.97%)</title><rect x="1602.7" y="1047" width="159.7" height="15.0" fill="rgb(248,121,121)" rx="2" ry="2" />
+<text  x="1605.73" y="1057.5" >androidx.compose.u..</text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.LayoutNodeSubcompositionsState$createMeasurePolicy$1$measure-3p2s80s$$inlined$createMeasureResult$2.placeChildren (388,108,637 ns, 7.83%)</title><rect x="239.3" y="1511" width="139.4" height="15.0" fill="rgb(227,89,89)" rx="2" ry="2" />
+<text  x="242.29" y="1521.5" >androidx.compose..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.replace (540,004,740 ns, 10.90%)</title><rect x="1577.3" y="583" width="194.0" height="15.0" fill="rgb(246,117,117)" rx="2" ry="2" />
+<text  x="1580.28" y="593.5" >androidx.compose.ui.nod..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.NodeCoordinator.onMeasured (5,901,486 ns, 0.12%)</title><rect x="867.6" y="1191" width="2.1" height="15.0" fill="rgb(205,58,58)" rx="2" ry="2" />
+<text  x="870.57" y="1201.5" ></text>
+</g>
+<g >
+<title>java.util.LinkedHashMap.get (5,901,488 ns, 0.12%)</title><rect x="656.2" y="1383" width="2.1" height="15.0" fill="rgb(249,122,122)" rx="2" ry="2" />
+<text  x="659.21" y="1393.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobNode.dispose (7,392,637 ns, 0.15%)</title><rect x="945.9" y="839" width="2.7" height="15.0" fill="rgb(252,126,126)" rx="2" ry="2" />
+<text  x="948.90" y="849.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.layout.SizeNode.measure-3p2s80s (1,274,909,003 ns, 25.73%)</title><rect x="424.6" y="1031" width="458.0" height="15.0" fill="rgb(224,85,85)" rx="2" ry="2" />
+<text  x="427.57" y="1041.5" >androidx.compose.foundation.layout.SizeNode.measure-3p2s80s</text>
+</g>
+<g >
+<title>androidx.compose.runtime.Recomposer$recompositionRunner$2$unregisterApplyObserver$1.invoke (676,767,369 ns, 13.66%)</title><rect x="1232.6" y="583" width="243.1" height="15.0" fill="rgb(242,111,111)" rx="2" ry="2" />
+<text  x="1235.57" y="593.5" >androidx.compose.runtime.Reco..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.DispatchedTaskKt.resume (595,727,031 ns, 12.02%)</title><rect x="1259.1" y="647" width="214.0" height="15.0" fill="rgb(252,125,125)" rx="2" ry="2" />
+<text  x="1262.08" y="657.5" >kotlinx.coroutines.Dispat..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.OnPositionedDispatcher.dispatch (43,277,578 ns, 0.87%)</title><rect x="1771.7" y="551" width="15.5" height="15.0" fill="rgb(213,69,69)" rx="2" ry="2" />
+<text  x="1774.65" y="561.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$readObserver$1.invoke (13,770,139 ns, 0.28%)</title><rect x="370.3" y="1623" width="4.9" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="373.25" y="1633.5" ></text>
+</g>
+<g >
+<title>art_quick_alloc_object_resolved_region_tlab (31,440,893 ns, 0.63%)</title><rect x="612.3" y="1367" width="11.3" height="15.0" fill="rgb(244,114,114)" rx="2" ry="2" />
+<text  x="615.31" y="1377.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.benchmark.lazy.LazyBenchmarkCommonKt.access$assertNoPendingRecompositionMeasureOrLayout (59,013,036 ns, 1.19%)</title><rect x="45.3" y="519" width="21.2" height="15.0" fill="rgb(229,92,92)" rx="2" ry="2" />
+<text  x="48.34" y="529.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.MutatorMutex$mutateWith$2.invokeSuspend (2,178,156,561 ns, 43.97%)</title><rect x="152.0" y="791" width="782.6" height="15.0" fill="rgb(242,111,111)" rx="2" ry="2" />
+<text  x="155.00" y="801.5" >androidx.compose.foundation.MutatorMutex$mutateWith$2.invokeSuspend</text>
+</g>
+<g >
+<title>androidx.benchmark.TimeCapture.captureResumed (8,852,231 ns, 0.18%)</title><rect x="42.2" y="519" width="3.1" height="15.0" fill="rgb(247,119,119)" rx="2" ry="2" />
+<text  x="45.16" y="529.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.AlignmentLines.recalculateQueryOwner (8,697,881 ns, 0.18%)</title><rect x="287.0" y="1703" width="3.1" height="15.0" fill="rgb(215,72,72)" rx="2" ry="2" />
+<text  x="290.00" y="1713.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.layout.SizeNode$measure$1.invoke (530,513,225 ns, 10.71%)</title><rect x="205.4" y="1047" width="190.6" height="15.0" fill="rgb(203,54,54)" rx="2" ry="2" />
+<text  x="208.36" y="1057.5" >androidx.compose.found..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.layout.LazyLayoutKt$LazyLayout$3$itemContentFactory$1$1.invoke (118,210,389 ns, 2.39%)</title><rect x="798.9" y="1287" width="42.5" height="15.0" fill="rgb(203,54,54)" rx="2" ry="2" />
+<text  x="801.95" y="1297.5" >and..</text>
+</g>
+<g >
+<title>androidx.compose.testutils.AndroidComposeTestCaseRunner.hasPendingChanges (34,425,347 ns, 0.69%)</title><rect x="51.7" y="535" width="12.4" height="15.0" fill="rgb(214,71,71)" rx="2" ry="2" />
+<text  x="54.70" y="545.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.sync.SemaphoreImpl.getAvailablePermits (11,802,976 ns, 0.24%)</title><rect x="926.1" y="839" width="4.3" height="15.0" fill="rgb(218,77,77)" rx="2" ry="2" />
+<text  x="929.11" y="849.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.EventLoopImplBase.processNextEvent (2,397,402,415 ns, 48.39%)</title><rect x="105.4" y="583" width="861.3" height="15.0" fill="rgb(231,95,95)" rx="2" ry="2" />
+<text  x="108.35" y="593.5" >kotlinx.coroutines.EventLoopImplBase.processNextEvent</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.placeOuterCoordinator-f8xVGno (234,461,607 ns, 4.73%)</title><rect x="1657.1" y="1335" width="84.3" height="15.0" fill="rgb(233,98,98)" rx="2" ry="2" />
+<text  x="1660.15" y="1345.5" >androidx..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.onNodePlaced$ui_release (30,336,670 ns, 0.61%)</title><rect x="279.2" y="1671" width="10.9" height="15.0" fill="rgb(203,55,55)" rx="2" ry="2" />
+<text  x="282.22" y="1681.5" ></text>
+</g>
+<g >
+<title>unknown (15,737,301 ns, 0.32%)</title><rect x="606.7" y="1431" width="5.6" height="15.0" fill="rgb(248,120,120)" rx="2" ry="2" />
+<text  x="609.66" y="1441.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$ObservedScopeMap.observe (565,060,340 ns, 11.41%)</title><rect x="195.5" y="951" width="203.0" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="198.47" y="961.5" >androidx.compose.runtime..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.benchmark.lazy.LazyBenchmarkCommonKt$toggleStateBenchmark$1$2.invoke (4,937,574,255 ns, 99.66%)</title><rect x="13.5" y="487" width="1774.1" height="15.0" fill="rgb(230,93,93)" rx="2" ry="2" />
+<text  x="16.53" y="497.5" >androidx.compose.foundation.benchmark.lazy.LazyBenchmarkCommonKt$toggleStateBenchmark$1$2.invoke</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotKt.overwriteUnusedRecordsLocked (5,901,488 ns, 0.12%)</title><rect x="1475.7" y="567" width="2.2" height="15.0" fill="rgb(202,53,53)" rx="2" ry="2" />
+<text  x="1478.73" y="577.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.DerivedSnapshotState$ResultRecord.readableHash (19,671,626 ns, 0.40%)</title><rect x="821.9" y="1447" width="7.1" height="15.0" fill="rgb(235,100,100)" rx="2" ry="2" />
+<text  x="824.92" y="1457.5" ></text>
+</g>
+<g >
+<title>atrace_int_body (6,885,070 ns, 0.14%)</title><rect x="1466.5" y="775" width="2.5" height="15.0" fill="rgb(237,104,104)" rx="2" ry="2" />
+<text  x="1469.49" y="785.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.Placeable$PlacementScope.placeRelative (468,072,825 ns, 9.45%)</title><rect x="1598.1" y="807" width="168.2" height="15.0" fill="rgb(250,123,123)" rx="2" ry="2" />
+<text  x="1601.13" y="817.5" >androidx.compose.ui..</text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.Placeable$PlacementScope.placeWithLayer$default (511,056,297 ns, 10.32%)</title><rect x="211.4" y="1191" width="183.6" height="15.0" fill="rgb(228,90,90)" rx="2" ry="2" />
+<text  x="214.37" y="1201.5" >androidx.compose.ui.l..</text>
+</g>
+<g >
+<title>write (12,752,848 ns, 0.26%)</title><rect x="618.3" y="1431" width="4.6" height="15.0" fill="rgb(225,87,87)" rx="2" ry="2" />
+<text  x="621.32" y="1441.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.Recomposer.deriveStateLocked (9,835,813 ns, 0.20%)</title><rect x="1238.9" y="599" width="3.6" height="15.0" fill="rgb(206,59,59)" rx="2" ry="2" />
+<text  x="1241.94" y="609.5" ></text>
+</g>
+<g >
+<title>android::AndroidRuntime::start(char const*, android::Vector&lt;android::String8&gt; const&amp;, bool) (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="103" width="1779.3" height="15.0" fill="rgb(196,196,57)" rx="2" ry="2" />
+<text  x="13.00" y="113.5" >android::AndroidRuntime::start(char const*, android::Vector&lt;android::String8&gt; const&amp;, bool)</text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.Placeable$PlacementScope.placeWithLayer (454,302,688 ns, 9.17%)</title><rect x="1600.3" y="983" width="163.2" height="15.0" fill="rgb(249,121,121)" rx="2" ry="2" />
+<text  x="1603.25" y="993.5" >androidx.compose.ui..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.Recomposer.getHasSchedulingWork (6,885,070 ns, 0.14%)</title><rect x="1296.5" y="727" width="2.5" height="15.0" fill="rgb(225,86,86)" rx="2" ry="2" />
+<text  x="1299.54" y="737.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListState.onScroll$foundation_release (93,196,071 ns, 1.88%)</title><rect x="1093.7" y="919" width="33.5" height="15.0" fill="rgb(236,103,103)" rx="2" ry="2" />
+<text  x="1096.71" y="929.5" >an..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.gestures.DefaultScrollableState$scroll$2.invokeSuspend (245,651,169 ns, 4.96%)</title><rect x="1064.4" y="743" width="88.2" height="15.0" fill="rgb(249,122,122)" rx="2" ry="2" />
+<text  x="1067.38" y="753.5" >androidx...</text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.makeCompletingOnce$kotlinx_coroutines_core (33,949,333 ns, 0.69%)</title><rect x="936.4" y="775" width="12.2" height="15.0" fill="rgb(239,107,107)" rx="2" ry="2" />
+<text  x="939.36" y="785.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.SnapshotMutableIntStateImpl.setIntValue (8,852,231 ns, 0.18%)</title><rect x="758.8" y="1383" width="3.2" height="15.0" fill="rgb(203,55,55)" rx="2" ry="2" />
+<text  x="761.83" y="1393.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListState$scrollableState$1.invoke (95,163,234 ns, 1.92%)</title><rect x="1093.0" y="903" width="34.2" height="15.0" fill="rgb(216,73,73)" rx="2" ry="2" />
+<text  x="1096.01" y="913.5" >an..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LookaheadCapablePlaceable.invalidateAlignmentLinesFromPositionChange (28,523,858 ns, 0.58%)</title><rect x="310.3" y="1687" width="10.2" height="15.0" fill="rgb(236,103,103)" rx="2" ry="2" />
+<text  x="313.27" y="1697.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotKt.overwritableRecord (11,802,975 ns, 0.24%)</title><rect x="1135.3" y="871" width="4.3" height="15.0" fill="rgb(234,100,100)" rx="2" ry="2" />
+<text  x="1138.33" y="881.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.gestures.ScrollExtensionsKt$scrollBy$2.invoke (114,834,859 ns, 2.32%)</title><rect x="1087.4" y="855" width="41.2" height="15.0" fill="rgb(254,129,129)" rx="2" ry="2" />
+<text  x="1090.35" y="865.5" >and..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.layout.FillNode$measure$1.invoke (519,908,528 ns, 10.49%)</title><rect x="208.2" y="1111" width="186.8" height="15.0" fill="rgb(235,101,101)" rx="2" ry="2" />
+<text  x="211.19" y="1121.5" >androidx.compose.found..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.gestures.DefaultScrollableState$scroll$2$1.invokeSuspend (157,128,855 ns, 3.17%)</title><rect x="1083.1" y="839" width="56.5" height="15.0" fill="rgb(250,124,124)" rx="2" ry="2" />
+<text  x="1086.11" y="849.5" >andro..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListItemAnimator.onMeasured (19,671,627 ns, 0.40%)</title><rect x="541.2" y="1335" width="7.1" height="15.0" fill="rgb(221,81,81)" rx="2" ry="2" />
+<text  x="544.19" y="1345.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.sync.MutexImpl.lock (7,438,231 ns, 0.15%)</title><rect x="922.7" y="807" width="2.7" height="15.0" fill="rgb(204,56,56)" rx="2" ry="2" />
+<text  x="925.73" y="817.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$readObserver$1.invoke (6,885,069 ns, 0.14%)</title><rect x="510.8" y="1367" width="2.5" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="513.79" y="1377.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.Snapshot$Companion.observe (555,224,527 ns, 11.21%)</title><rect x="198.6" y="967" width="199.5" height="15.0" fill="rgb(252,126,126)" rx="2" ry="2" />
+<text  x="201.65" y="977.5" >androidx.compose.runtime..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.AndroidOverscroll_androidKt$StretchOverscrollNonClippingLayer$2.invoke (1,140,531,056 ns, 23.02%)</title><rect x="457.1" y="1207" width="409.8" height="15.0" fill="rgb(204,56,56)" rx="2" ry="2" />
+<text  x="460.08" y="1217.5" >androidx.compose.foundation.AndroidOverscroll_andro..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.BuildersKt.runBlocking$default (544,708,292 ns, 10.99%)</title><rect x="1000.8" y="535" width="195.7" height="15.0" fill="rgb(233,98,98)" rx="2" ry="2" />
+<text  x="1003.82" y="545.5" >kotlinx.coroutines.Buil..</text>
+</g>
+<g >
+<title>androidx.compose.testutils.AndroidComposeTestCaseRunner.hasPendingChanges (1,003,672,705 ns, 20.26%)</title><rect x="1197.9" y="519" width="360.7" height="15.0" fill="rgb(214,71,71)" rx="2" ry="2" />
+<text  x="1200.94" y="529.5" >androidx.compose.testutils.AndroidComposeTest..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver.observeReads (453,025,003 ns, 9.14%)</title><rect x="225.2" y="1431" width="162.7" height="15.0" fill="rgb(214,70,70)" rx="2" ry="2" />
+<text  x="228.15" y="1441.5" >androidx.compose.ru..</text>
+</g>
+<g >
+<title>art_quick_alloc_array_resolved32_region_tlab (7,868,648 ns, 0.16%)</title><rect x="602.7" y="1383" width="2.9" height="15.0" fill="rgb(207,60,60)" rx="2" ry="2" />
+<text  x="605.74" y="1393.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.CoroutineContextKt.foldCopies (11,802,976 ns, 0.24%)</title><rect x="968.1" y="583" width="4.3" height="15.0" fill="rgb(212,68,68)" rx="2" ry="2" />
+<text  x="971.13" y="593.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.CoroutineScopeKt.coroutineScope (236,798,938 ns, 4.78%)</title><rect x="1066.9" y="759" width="85.0" height="15.0" fill="rgb(222,83,83)" rx="2" ry="2" />
+<text  x="1069.86" y="769.5" >kotlinx.c..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.forEachChildAlignmentLinesOwner (11,802,976 ns, 0.24%)</title><rect x="1750.8" y="1191" width="4.2" height="15.0" fill="rgb(206,59,59)" rx="2" ry="2" />
+<text  x="1753.77" y="1201.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver.observeReads (533,119,671 ns, 10.76%)</title><rect x="1579.8" y="615" width="191.5" height="15.0" fill="rgb(214,70,70)" rx="2" ry="2" />
+<text  x="1582.75" y="625.5" >androidx.compose.runti..</text>
+</g>
+<g >
+<title>kotlin.jvm.internal.TypeIntrinsics.beforeCheckcastToFunctionOfArity (6,885,069 ns, 0.14%)</title><rect x="950.1" y="711" width="2.5" height="15.0" fill="rgb(252,126,126)" rx="2" ry="2" />
+<text  x="953.11" y="721.5" ></text>
+</g>
+<g >
+<title>artAllocObjectFromCodeResolvedRegionTLAB (24,555,824 ns, 0.50%)</title><rect x="614.1" y="1383" width="8.8" height="15.0" fill="rgb(214,70,70)" rx="2" ry="2" />
+<text  x="617.08" y="1393.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$readObserver$1.invoke (5,901,488 ns, 0.12%)</title><rect x="511.1" y="1383" width="2.2" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="514.15" y="1393.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver.observeReads (393,766,229 ns, 7.95%)</title><rect x="1614.7" y="1111" width="141.5" height="15.0" fill="rgb(214,70,70)" rx="2" ry="2" />
+<text  x="1617.74" y="1121.5" >androidx.compose..</text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.Placeable$PlacementScope.placeWithLayer (460,204,175 ns, 9.29%)</title><rect x="1598.8" y="887" width="165.4" height="15.0" fill="rgb(249,121,121)" rx="2" ry="2" />
+<text  x="1601.84" y="897.5" >androidx.compose.ui..</text>
+</g>
+<g >
+<title>kotlin.coroutines.intrinsics.IntrinsicsKt__IntrinsicsJvmKt.createCoroutineUnintercepted (6,885,068 ns, 0.14%)</title><rect x="1179.7" y="615" width="2.5" height="15.0" fill="rgb(246,117,117)" rx="2" ry="2" />
+<text  x="1182.71" y="625.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$readObserver$1.invoke (79,016,108 ns, 1.59%)</title><rect x="805.3" y="1351" width="28.4" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="808.31" y="1361.5" >a..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.MutatorMutex$mutateWith$2.invokeSuspend (190,570,620 ns, 3.85%)</title><rect x="1078.5" y="807" width="68.5" height="15.0" fill="rgb(242,111,111)" rx="2" ry="2" />
+<text  x="1081.52" y="817.5" >androi..</text>
+</g>
+<g >
+<title>kotlin.collections.ArrayDeque.add (26,456,903 ns, 0.53%)</title><rect x="743.3" y="1335" width="9.5" height="15.0" fill="rgb(234,100,100)" rx="2" ry="2" />
+<text  x="746.32" y="1345.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.Snapshot$Companion.observe (438,271,283 ns, 8.85%)</title><rect x="230.5" y="1463" width="157.4" height="15.0" fill="rgb(252,126,126)" rx="2" ry="2" />
+<text  x="233.45" y="1473.5" >androidx.compose.r..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate$layoutChildrenBlock$1.invoke (376,645,357 ns, 7.60%)</title><rect x="1619.7" y="1175" width="135.3" height="15.0" fill="rgb(201,52,52)" rx="2" ry="2" />
+<text  x="1622.69" y="1185.5" >androidx.compos..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LookaheadCapablePlaceable$layout$1.placeChildren (532,480,388 ns, 10.75%)</title><rect x="204.7" y="1031" width="191.3" height="15.0" fill="rgb(231,96,96)" rx="2" ry="2" />
+<text  x="207.66" y="1041.5" >androidx.compose.ui.no..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.SnapshotMutableStateImpl.getValue (21,203,246 ns, 0.43%)</title><rect x="1741.7" y="1271" width="7.7" height="15.0" fill="rgb(248,120,120)" rx="2" ry="2" />
+<text  x="1744.74" y="1281.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.gestures.ScrollExtensionsKt$scrollBy$2.invokeSuspend (107,949,791 ns, 2.18%)</title><rect x="1088.8" y="871" width="38.8" height="15.0" fill="rgb(235,101,101)" rx="2" ry="2" />
+<text  x="1091.77" y="881.5" >and..</text>
+</g>
+<g >
+<title>androidx.collection.ScatterMap.get (17,425,014 ns, 0.35%)</title><rect x="1421.2" y="775" width="6.3" height="15.0" fill="rgb(229,93,93)" rx="2" ry="2" />
+<text  x="1424.22" y="785.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.Recomposer.deriveStateLocked (10,819,394 ns, 0.22%)</title><rect x="1462.6" y="727" width="3.9" height="15.0" fill="rgb(206,59,59)" rx="2" ry="2" />
+<text  x="1465.60" y="737.5" ></text>
+</g>
+<g >
+<title>android.view.ViewGroup.onDescendantInvalidated (18,688,046 ns, 0.38%)</title><rect x="1726.9" y="1415" width="6.7" height="15.0" fill="rgb(236,103,103)" rx="2" ry="2" />
+<text  x="1729.90" y="1425.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.CoroutineContextKt.newCoroutineContext (18,941,009 ns, 0.38%)</title><rect x="1170.1" y="567" width="6.8" height="15.0" fill="rgb(210,65,65)" rx="2" ry="2" />
+<text  x="1173.08" y="577.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.BlockingCoroutine.joinBlocking (2,451,899,020 ns, 49.49%)</title><rect x="85.8" y="567" width="880.9" height="15.0" fill="rgb(206,59,59)" rx="2" ry="2" />
+<text  x="88.77" y="577.5" >kotlinx.coroutines.BlockingCoroutine.joinBlocking</text>
+</g>
+<g >
+<title>androidx.compose.ui.platform.RenderNodeApi29.getLeft (13,770,139 ns, 0.28%)</title><rect x="1733.6" y="1383" width="5.0" height="15.0" fill="rgb(215,71,71)" rx="2" ry="2" />
+<text  x="1736.61" y="1393.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.AlignmentLines.onAlignmentsChanged (9,835,813 ns, 0.20%)</title><rect x="317.0" y="1703" width="3.5" height="15.0" fill="rgb(202,53,53)" rx="2" ry="2" />
+<text  x="319.98" y="1713.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.NodeCoordinator.onPlaced (5,901,488 ns, 0.12%)</title><rect x="1764.2" y="839" width="2.1" height="15.0" fill="rgb(239,107,107)" rx="2" ry="2" />
+<text  x="1767.18" y="849.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.CompositionImpl.recordModificationsOf (343,379,612 ns, 6.93%)</title><rect x="1339.2" y="727" width="123.4" height="15.0" fill="rgb(249,121,121)" rx="2" ry="2" />
+<text  x="1342.23" y="737.5" >androidx.compo..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.AbstractCoroutine.resumeWith (17,704,463 ns, 0.36%)</title><rect x="1160.4" y="631" width="6.4" height="15.0" fill="rgb(250,123,123)" rx="2" ry="2" />
+<text  x="1163.42" y="641.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate$layoutChildrenBlock$1.invoke (431,386,214 ns, 8.71%)</title><rect x="232.6" y="1479" width="155.0" height="15.0" fill="rgb(201,52,52)" rx="2" ry="2" />
+<text  x="235.57" y="1489.5" >androidx.compose.u..</text>
+</g>
+<g >
+<title>android.app.ActivityThread.main (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="327" width="1779.3" height="15.0" fill="rgb(231,95,95)" rx="2" ry="2" />
+<text  x="13.00" y="337.5" >android.app.ActivityThread.main</text>
+</g>
+<g >
+<title>androidx.compose.runtime.DerivedSnapshotState$ResultRecord.isValid (31,804,204 ns, 0.64%)</title><rect x="817.7" y="1431" width="11.4" height="15.0" fill="rgb(237,104,104)" rx="2" ry="2" />
+<text  x="820.68" y="1441.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.platform.AndroidComposeView.scheduleMeasureAndLayout (15,737,301 ns, 0.32%)</title><rect x="1551.4" y="695" width="5.6" height="15.0" fill="rgb(224,86,86)" rx="2" ry="2" />
+<text  x="1554.36" y="705.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListState.cancelPrefetchIfVisibleItemsChanged (8,852,232 ns, 0.18%)</title><rect x="762.0" y="1351" width="3.2" height="15.0" fill="rgb(226,88,88)" rx="2" ry="2" />
+<text  x="765.01" y="1361.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListMeasuredItem.&lt;init&gt; (29,607,023 ns, 0.60%)</title><rect x="601.7" y="1367" width="10.6" height="15.0" fill="rgb(238,105,105)" rx="2" ry="2" />
+<text  x="604.68" y="1377.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.Recomposer.awaitWorkAvailable (82,427,649 ns, 1.66%)</title><rect x="1290.2" y="711" width="29.6" height="15.0" fill="rgb(237,104,104)" rx="2" ry="2" />
+<text  x="1293.18" y="721.5" >a..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.CoroutineDispatcher.interceptContinuation (17,292,128 ns, 0.35%)</title><rect x="1184.0" y="647" width="6.2" height="15.0" fill="rgb(211,66,66)" rx="2" ry="2" />
+<text  x="1186.95" y="657.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListMeasureResult.tryToApplyScrollWithoutRemeasure (25,573,114 ns, 0.52%)</title><rect x="1103.3" y="935" width="9.1" height="15.0" fill="rgb(200,51,51)" rx="2" ry="2" />
+<text  x="1106.26" y="945.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$readObserver$1.invoke (10,819,395 ns, 0.22%)</title><rect x="837.2" y="1351" width="3.9" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="840.23" y="1361.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.makeCompletingOnce$kotlinx_coroutines_core (13,770,138 ns, 0.28%)</title><rect x="1161.5" y="647" width="4.9" height="15.0" fill="rgb(239,107,107)" rx="2" ry="2" />
+<text  x="1164.48" y="657.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.AndroidOverscroll_androidKt$StretchOverscrollNonClippingLayer$1$1.invoke (504,171,228 ns, 10.18%)</title><rect x="213.5" y="1255" width="181.1" height="15.0" fill="rgb(212,68,68)" rx="2" ry="2" />
+<text  x="216.49" y="1265.5" >androidx.compose.foun..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.gestures.DefaultScrollableState$scroll$2$1.invokeSuspend (2,123,255,919 ns, 42.86%)</title><rect x="157.7" y="823" width="762.8" height="15.0" fill="rgb(250,124,124)" rx="2" ry="2" />
+<text  x="160.66" y="833.5" >androidx.compose.foundation.gestures.DefaultScrollableState$scroll$2$1.invokeSuspend</text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.makeCompletingOnce$kotlinx_coroutines_core (11,802,975 ns, 0.24%)</title><rect x="1147.7" y="791" width="4.2" height="15.0" fill="rgb(239,107,107)" rx="2" ry="2" />
+<text  x="1150.70" y="801.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.MutableSnapshot.recordModified$runtime_release (14,753,719 ns, 0.30%)</title><rect x="776.9" y="1399" width="5.3" height="15.0" fill="rgb(242,111,111)" rx="2" ry="2" />
+<text  x="779.92" y="1409.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$applyObserver$1.invoke (182,419,548 ns, 3.68%)</title><rect x="1492.5" y="567" width="65.6" height="15.0" fill="rgb(237,105,105)" rx="2" ry="2" />
+<text  x="1495.53" y="577.5" >androi..</text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.LayoutNodeSubcompositionsState.subcompose (31,597,805 ns, 0.64%)</title><rect x="677.5" y="1399" width="11.3" height="15.0" fill="rgb(254,128,128)" rx="2" ry="2" />
+<text  x="680.49" y="1409.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.onNodePlaced$ui_release (467,778,722 ns, 9.44%)</title><rect x="221.3" y="1399" width="168.0" height="15.0" fill="rgb(203,55,55)" rx="2" ry="2" />
+<text  x="224.27" y="1409.5" >androidx.compose.ui..</text>
+</g>
+<g >
+<title>[DEDUPED] androidx.compose.ui.layout.Placeable$PlacementScope.? (312,372,874 ns, 6.31%)</title><rect x="254.1" y="1623" width="112.3" height="15.0" fill="rgb(207,60,60)" rx="2" ry="2" />
+<text  x="257.13" y="1633.5" >[DEDUPED] an..</text>
+</g>
+<g >
+<title>androidx.collection.MutableScatterSet.clear (6,885,069 ns, 0.14%)</title><rect x="1538.6" y="663" width="2.5" height="15.0" fill="rgb(242,112,112)" rx="2" ry="2" />
+<text  x="1541.64" y="673.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.measure-BRTryo0 (78,717,909 ns, 1.59%)</title><rect x="693.5" y="1367" width="28.3" height="15.0" fill="rgb(216,74,74)" rx="2" ry="2" />
+<text  x="696.55" y="1377.5" >a..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.Snapshot$Companion.sendApplyNotifications (977,116,009 ns, 19.72%)</title><rect x="1207.5" y="535" width="351.1" height="15.0" fill="rgb(250,123,123)" rx="2" ry="2" />
+<text  x="1210.48" y="545.5" >androidx.compose.runtime.snapshots.Snapshot..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate.performMeasure-BRTryo0 (1,326,718,636 ns, 26.78%)</title><rect x="408.7" y="935" width="476.6" height="15.0" fill="rgb(205,57,57)" rx="2" ry="2" />
+<text  x="411.66" y="945.5" >androidx.compose.ui.node.LayoutNodeLayoutDelegate.performMea..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.BlockingCoroutine.joinBlocking (438,508,357 ns, 8.85%)</title><rect x="1012.5" y="567" width="157.6" height="15.0" fill="rgb(206,59,59)" rx="2" ry="2" />
+<text  x="1015.53" y="577.5" >kotlinx.coroutines..</text>
+</g>
+<g >
+<title>kotlin.collections.ArraysKt___ArraysJvmKt.copyInto (8,682,666 ns, 0.18%)</title><rect x="915.7" y="903" width="3.2" height="15.0" fill="rgb(232,97,97)" rx="2" ry="2" />
+<text  x="918.73" y="913.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.platform.AndroidComposeView$snapshotObserver$1.invoke (85,571,574 ns, 1.73%)</title><rect x="1526.3" y="599" width="30.7" height="15.0" fill="rgb(242,111,111)" rx="2" ry="2" />
+<text  x="1529.27" y="609.5" >an..</text>
+</g>
+<g >
+<title>kotlin.coroutines.jvm.internal.BaseContinuationImpl.resumeWith (2,366,911,395 ns, 47.78%)</title><rect x="115.6" y="615" width="850.4" height="15.0" fill="rgb(231,96,96)" rx="2" ry="2" />
+<text  x="118.60" y="625.5" >kotlin.coroutines.jvm.internal.BaseContinuationImpl.resumeWith</text>
+</g>
+<g >
+<title>kotlinx.coroutines.EventLoop.decrementUseCount (49,578,698 ns, 1.00%)</title><rect x="87.5" y="583" width="17.9" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="90.54" y="593.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.NodeCoordinator.onMeasured (8,852,230 ns, 0.18%)</title><rect x="871.5" y="1127" width="3.1" height="15.0" fill="rgb(205,58,58)" rx="2" ry="2" />
+<text  x="874.46" y="1137.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.EventLoopImplBase.enqueue (7,868,650 ns, 0.16%)</title><rect x="1192.6" y="647" width="2.9" height="15.0" fill="rgb(227,89,89)" rx="2" ry="2" />
+<text  x="1195.64" y="657.5" ></text>
+</g>
+<g >
+<title>unknown (10,785,686 ns, 0.22%)</title><rect x="619.0" y="1479" width="3.9" height="15.0" fill="rgb(248,120,120)" rx="2" ry="2" />
+<text  x="622.03" y="1489.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.Recomposer$recompositionRunner$2$unregisterApplyObserver$1.invoke (683,652,438 ns, 13.80%)</title><rect x="1230.1" y="567" width="245.6" height="15.0" fill="rgb(242,111,111)" rx="2" ry="2" />
+<text  x="1233.10" y="577.5" >androidx.compose.runtime.Recom..</text>
+</g>
+<g >
+<title>artAllocArrayFromCodeResolvedRegionTLAB (6,885,070 ns, 0.14%)</title><rect x="1466.5" y="743" width="2.5" height="15.0" fill="rgb(234,100,100)" rx="2" ry="2" />
+<text  x="1469.49" y="753.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.AbstractCoroutine.resumeWith (10,819,395 ns, 0.22%)</title><rect x="962.1" y="631" width="3.9" height="15.0" fill="rgb(250,123,123)" rx="2" ry="2" />
+<text  x="965.12" y="641.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.LayoutNodeSubcompositionsState$Scope$layout$1.placeChildren (380,239,986 ns, 7.68%)</title><rect x="240.3" y="1543" width="136.7" height="15.0" fill="rgb(200,51,51)" rx="2" ry="2" />
+<text  x="243.35" y="1553.5" >androidx.compos..</text>
+</g>
+<g >
+<title>androidx.compose.ui.platform.RenderNodeLayer.move--gyyYBs (72,785,020 ns, 1.47%)</title><rect x="1715.2" y="1367" width="26.2" height="15.0" fill="rgb(218,77,77)" rx="2" ry="2" />
+<text  x="1718.24" y="1377.5" >a..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate$placeOuterCoordinatorBlock$1.invoke (549,323,040 ns, 11.09%)</title><rect x="200.8" y="999" width="197.3" height="15.0" fill="rgb(248,119,119)" rx="2" ry="2" />
+<text  x="203.77" y="1009.5" >androidx.compose.ui.nod..</text>
+</g>
+<g >
+<title>kotlin.coroutines.jvm.internal.ContinuationImpl.releaseIntercepted (5,901,488 ns, 0.12%)</title><rect x="1158.3" y="631" width="2.1" height="15.0" fill="rgb(242,111,111)" rx="2" ry="2" />
+<text  x="1161.30" y="641.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListItemProviderImpl.getContentType (20,655,207 ns, 0.42%)</title><rect x="585.8" y="1351" width="7.4" height="15.0" fill="rgb(219,77,77)" rx="2" ry="2" />
+<text  x="588.77" y="1361.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.layout.SizeNode$measure$1.invoke (478,892,220 ns, 9.67%)</title><rect x="1595.3" y="727" width="172.1" height="15.0" fill="rgb(203,54,54)" rx="2" ry="2" />
+<text  x="1598.30" y="737.5" >androidx.compose.fou..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.remeasure-BRTryo0 (31,474,603 ns, 0.64%)</title><rect x="710.2" y="1383" width="11.3" height="15.0" fill="rgb(229,92,92)" rx="2" ry="2" />
+<text  x="713.24" y="1393.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LookaheadCapablePlaceable$layout$1.placeChildren (471,023,569 ns, 9.51%)</title><rect x="1597.1" y="775" width="169.2" height="15.0" fill="rgb(231,96,96)" rx="2" ry="2" />
+<text  x="1600.07" y="785.5" >androidx.compose.ui...</text>
+</g>
+<g >
+<title>androidx.collection.MutableScatterSet.add (7,868,650 ns, 0.16%)</title><rect x="1521.9" y="615" width="2.9" height="15.0" fill="rgb(225,86,86)" rx="2" ry="2" />
+<text  x="1524.92" y="625.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.tryFinalizeSimpleState (7,868,649 ns, 0.16%)</title><rect x="953.3" y="743" width="2.8" height="15.0" fill="rgb(222,83,83)" rx="2" ry="2" />
+<text  x="956.29" y="753.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutModifierNodeCoordinator.placeAt-f8xVGno (475,941,476 ns, 9.61%)</title><rect x="1596.4" y="759" width="171.0" height="15.0" fill="rgb(221,80,80)" rx="2" ry="2" />
+<text  x="1599.36" y="769.5" >androidx.compose.ui...</text>
+</g>
+<g >
+<title>kotlinx.coroutines.flow.StateFlowImpl.setValue (5,901,488 ns, 0.12%)</title><rect x="1464.4" y="743" width="2.1" height="15.0" fill="rgb(232,97,97)" rx="2" ry="2" />
+<text  x="1467.37" y="753.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.platform.RenderNodeApi29.offsetLeftAndRight (5,901,487 ns, 0.12%)</title><rect x="364.0" y="1703" width="2.1" height="15.0" fill="rgb(233,98,98)" rx="2" ry="2" />
+<text  x="367.03" y="1713.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.TransparentObserverMutableSnapshot.recordModified$runtime_release (16,720,882 ns, 0.34%)</title><rect x="776.2" y="1383" width="6.0" height="15.0" fill="rgb(204,56,56)" rx="2" ry="2" />
+<text  x="779.22" y="1393.5" ></text>
+</g>
+<g >
+<title>_JNIEnv::CallStaticVoidMethod(_jclass*, _jmethodID*, ...) (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="119" width="1779.3" height="15.0" fill="rgb(198,198,58)" rx="2" ry="2" />
+<text  x="13.00" y="129.5" >_JNIEnv::CallStaticVoidMethod(_jclass*, _jmethodID*, ...)</text>
+</g>
+<g >
+<title>art::JNI&lt;true&gt;::CallStaticVoidMethodV(_JNIEnv*, _jclass*, _jmethodID*, std::__va_list) (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="135" width="1779.3" height="15.0" fill="rgb(187,187,54)" rx="2" ry="2" />
+<text  x="13.00" y="145.5" >art::JNI&lt;true&gt;::CallStaticVoidMethodV(_JNIEnv*, _jclass*, _jmethodID*, std::__va_list)</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutModifierNodeCoordinator.placeAt-f8xVGno (546,372,296 ns, 11.03%)</title><rect x="201.8" y="1015" width="196.3" height="15.0" fill="rgb(221,80,80)" rx="2" ry="2" />
+<text  x="204.83" y="1025.5" >androidx.compose.ui.nod..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.internal.DispatchedContinuationKt.resumeCancellableWith (8,852,232 ns, 0.18%)</title><rect x="992.9" y="615" width="3.1" height="15.0" fill="rgb(229,92,92)" rx="2" ry="2" />
+<text  x="995.87" y="625.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.SnapshotMutableStateImpl.setValue (7,868,650 ns, 0.16%)</title><rect x="1120.3" y="951" width="2.8" height="15.0" fill="rgb(217,76,76)" rx="2" ry="2" />
+<text  x="1123.26" y="961.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.AndroidOverscroll_androidKt$StretchOverscrollNonClippingLayer$1.invoke-3p2s80s (1,171,022,073 ns, 23.64%)</title><rect x="450.7" y="1159" width="420.8" height="15.0" fill="rgb(240,108,108)" rx="2" ry="2" />
+<text  x="453.72" y="1169.5" >androidx.compose.foundation.AndroidOverscroll_androi..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.gestures.DefaultScrollableState$scroll$2.invoke (2,265,602,521 ns, 45.73%)</title><rect x="136.1" y="711" width="814.0" height="15.0" fill="rgb(214,70,70)" rx="2" ry="2" />
+<text  x="139.10" y="721.5" >androidx.compose.foundation.gestures.DefaultScrollableState$scroll$2.invoke</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.NodeCoordinator.placeSelf-f8xVGno (211,603,434 ns, 4.27%)</title><rect x="290.1" y="1671" width="76.0" height="15.0" fill="rgb(232,97,97)" rx="2" ry="2" />
+<text  x="293.12" y="1681.5" >android..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.MeasureAndLayoutDelegate.measureAndLayout-0kLqBqw (1,955,509,052 ns, 39.47%)</title><rect x="183.1" y="887" width="702.6" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="186.10" y="897.5" >androidx.compose.ui.node.MeasureAndLayoutDelegate.measureAndLayout-0kLqBqw</text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListMeasureKt$measureLazyList$7.invoke (322,548,383 ns, 6.51%)</title><rect x="1633.5" y="1255" width="115.9" height="15.0" fill="rgb(230,93,93)" rx="2" ry="2" />
+<text  x="1636.47" y="1265.5" >androidx.comp..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver.observeReads (1,322,784,311 ns, 26.70%)</title><rect x="410.1" y="951" width="475.2" height="15.0" fill="rgb(214,70,70)" rx="2" ry="2" />
+<text  x="413.08" y="961.5" >androidx.compose.runtime.snapshots.SnapshotStateObserver.ob..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.BuildersKt.runBlocking$default (2,574,278,001 ns, 51.96%)</title><rect x="72.9" y="535" width="924.9" height="15.0" fill="rgb(233,98,98)" rx="2" ry="2" />
+<text  x="75.90" y="545.5" >kotlinx.coroutines.BuildersKt.runBlocking$default</text>
+</g>
+<g >
+<title>androidx.compose.foundation.gestures.ScrollExtensionsKt.scrollBy (324,337,673 ns, 6.55%)</title><rect x="1041.8" y="647" width="116.5" height="15.0" fill="rgb(254,129,129)" rx="2" ry="2" />
+<text  x="1044.77" y="657.5" >androidx.comp..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LookaheadCapablePlaceable$layout$1.placeChildren (508,105,553 ns, 10.26%)</title><rect x="212.1" y="1239" width="182.5" height="15.0" fill="rgb(231,96,96)" rx="2" ry="2" />
+<text  x="215.08" y="1249.5" >androidx.compose.ui.n..</text>
+</g>
+<g >
+<title>java.util.HashMap.putVal (26,208,186 ns, 0.53%)</title><rect x="731.8" y="1383" width="9.4" height="15.0" fill="rgb(225,87,87)" rx="2" ry="2" />
+<text  x="734.79" y="1393.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LookaheadCapablePlaceable$layout$1.placeChildren (448,401,201 ns, 9.05%)</title><rect x="1601.3" y="1015" width="161.1" height="15.0" fill="rgb(231,96,96)" rx="2" ry="2" />
+<text  x="1604.31" y="1025.5" >androidx.compose.ui..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.benchmark.lazy.ListRemeasureTestCase$beforeToggle$1.invokeSuspend (2,337,403,954 ns, 47.18%)</title><rect x="118.8" y="631" width="839.8" height="15.0" fill="rgb(205,57,57)" rx="2" ry="2" />
+<text  x="121.78" y="641.5" >androidx.compose.foundation.benchmark.lazy.ListRemeasureTestCase$beforeToggle$1.invokeSuspend</text>
+</g>
+<g >
+<title>kotlinx.coroutines.internal.ScopeCoroutine.&lt;init&gt; (32,458,183 ns, 0.66%)</title><rect x="1049.9" y="711" width="11.7" height="15.0" fill="rgb(217,75,75)" rx="2" ry="2" />
+<text  x="1052.89" y="721.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.AndroidOverscroll_androidKt$StretchOverscrollNonClippingLayer$2$1.invoke (447,417,620 ns, 9.03%)</title><rect x="1601.7" y="1031" width="160.7" height="15.0" fill="rgb(205,58,58)" rx="2" ry="2" />
+<text  x="1604.67" y="1041.5" >androidx.compose.f..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.Snapshot$Companion.observe (1,303,432,860 ns, 26.31%)</title><rect x="416.1" y="983" width="468.3" height="15.0" fill="rgb(252,126,126)" rx="2" ry="2" />
+<text  x="419.09" y="993.5" >androidx.compose.runtime.snapshots.Snapshot$Companion.observe</text>
+</g>
+<g >
+<title>androidx.compose.runtime.collection.IdentityArraySet.add (10,819,394 ns, 0.22%)</title><rect x="778.3" y="1415" width="3.9" height="15.0" fill="rgb(207,61,61)" rx="2" ry="2" />
+<text  x="781.34" y="1425.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListMeasureKt$measureLazyList$7.invoke (380,239,986 ns, 7.68%)</title><rect x="240.3" y="1559" width="136.7" height="15.0" fill="rgb(230,93,93)" rx="2" ry="2" />
+<text  x="243.35" y="1569.5" >androidx.compos..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.DerivedSnapshotState$ResultRecord.isValid (9,835,813 ns, 0.20%)</title><rect x="823.3" y="1495" width="3.6" height="15.0" fill="rgb(237,104,104)" rx="2" ry="2" />
+<text  x="826.33" y="1505.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.platform.AndroidComposeView.onLayoutChange (45,244,742 ns, 0.91%)</title><rect x="323.4" y="1687" width="16.2" height="15.0" fill="rgb(237,105,105)" rx="2" ry="2" />
+<text  x="326.39" y="1697.5" ></text>
+</g>
+<g >
+<title>kotlin.coroutines.jvm.internal.ContinuationImpl.intercepted (26,556,696 ns, 0.54%)</title><rect x="983.3" y="631" width="9.6" height="15.0" fill="rgb(246,118,118)" rx="2" ry="2" />
+<text  x="986.33" y="641.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.makeCompletingOnce$kotlinx_coroutines_core (9,835,812 ns, 0.20%)</title><rect x="952.6" y="711" width="3.5" height="15.0" fill="rgb(239,107,107)" rx="2" ry="2" />
+<text  x="955.58" y="721.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.layout.FillNode$measure$1.invoke (469,056,406 ns, 9.47%)</title><rect x="1597.8" y="791" width="168.5" height="15.0" fill="rgb(235,101,101)" rx="2" ry="2" />
+<text  x="1600.78" y="801.5" >androidx.compose.fo..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.replace (578,830,479 ns, 11.68%)</title><rect x="190.5" y="903" width="208.0" height="15.0" fill="rgb(246,117,117)" rx="2" ry="2" />
+<text  x="193.52" y="913.5" >androidx.compose.ui.node...</text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.initParentJob (7,868,650 ns, 0.16%)</title><rect x="141.4" y="791" width="2.8" height="15.0" fill="rgb(245,116,116)" rx="2" ry="2" />
+<text  x="144.40" y="801.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.Placeable$PlacementScope.placeRelativeWithLayer-aW-9-wM$default (314,340,037 ns, 6.34%)</title><rect x="253.4" y="1607" width="113.0" height="15.0" fill="rgb(234,100,100)" rx="2" ry="2" />
+<text  x="256.43" y="1617.5" >androidx.com..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.gestures.ContentInViewNode.onRemeasured-ozmzZPI (5,901,488 ns, 0.12%)</title><rect x="851.0" y="1271" width="2.1" height="15.0" fill="rgb(210,64,64)" rx="2" ry="2" />
+<text  x="853.96" y="1281.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.AndroidOverscroll_androidKt$StretchOverscrollNonClippingLayer$1$1.invoke (455,286,269 ns, 9.19%)</title><rect x="1599.9" y="935" width="163.6" height="15.0" fill="rgb(212,68,68)" rx="2" ry="2" />
+<text  x="1602.90" y="945.5" >androidx.compose.fo..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.tryFinalizeSimpleState (21,162,775 ns, 0.43%)</title><rect x="941.0" y="807" width="7.6" height="15.0" fill="rgb(222,83,83)" rx="2" ry="2" />
+<text  x="943.95" y="817.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.SnapshotMutableIntStateImpl.setIntValue (9,835,812 ns, 0.20%)</title><rect x="167.6" y="871" width="3.5" height="15.0" fill="rgb(203,55,55)" rx="2" ry="2" />
+<text  x="170.55" y="881.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$ObservedScopeMap.observe (1,312,285,092 ns, 26.49%)</title><rect x="413.6" y="967" width="471.5" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="416.61" y="977.5" >androidx.compose.runtime.snapshots.SnapshotStateObserver$Ob..</text>
+</g>
+<g >
+<title>android.view.accessibility.AccessibilityManager.isEnabled (10,819,395 ns, 0.22%)</title><rect x="331.9" y="1703" width="3.9" height="15.0" fill="rgb(226,88,88)" rx="2" ry="2" />
+<text  x="334.87" y="1713.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.internal.DispatchedContinuation.&lt;init&gt; (12,374,222 ns, 0.25%)</title><rect x="1185.7" y="663" width="4.5" height="15.0" fill="rgb(231,95,95)" rx="2" ry="2" />
+<text  x="1188.72" y="673.5" ></text>
+</g>
+<g >
+<title>java.util.concurrent.atomic.AtomicReference.getAndSet (11,802,976 ns, 0.24%)</title><rect x="1457.2" y="759" width="4.3" height="15.0" fill="rgb(204,56,56)" rx="2" ry="2" />
+<text  x="1460.22" y="769.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.tryMakeCompleting (29,031,426 ns, 0.59%)</title><rect x="938.1" y="791" width="10.5" height="15.0" fill="rgb(213,69,69)" rx="2" ry="2" />
+<text  x="941.13" y="801.5" ></text>
+</g>
+<g >
+<title>art_quick_alloc_array_resolved32_region_tlab (6,885,070 ns, 0.14%)</title><rect x="1466.5" y="727" width="2.5" height="15.0" fill="rgb(207,60,60)" rx="2" ry="2" />
+<text  x="1469.49" y="737.5" ></text>
+</g>
+<g >
+<title>android.os.Looper.loop (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="343" width="1779.3" height="15.0" fill="rgb(203,55,55)" rx="2" ry="2" />
+<text  x="13.00" y="353.5" >android.os.Looper.loop</text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.layout.LazyLayoutKt$LazyLayout$3$2$1.invoke (1,005,787,746 ns, 20.30%)</title><rect x="480.8" y="1271" width="361.3" height="15.0" fill="rgb(242,111,111)" rx="2" ry="2" />
+<text  x="483.76" y="1281.5" >androidx.compose.foundation.lazy.layout.LazyL..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.layout.FillNode.measure-3p2s80s (1,222,779,194 ns, 24.68%)</title><rect x="440.5" y="1063" width="439.3" height="15.0" fill="rgb(201,52,52)" rx="2" ry="2" />
+<text  x="443.47" y="1073.5" >androidx.compose.foundation.layout.FillNode.measure-3p2..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.AndroidOverscroll_androidKt$StretchOverscrollNonClippingLayer$1.invoke (1,173,972,817 ns, 23.70%)</title><rect x="449.7" y="1143" width="421.8" height="15.0" fill="rgb(211,67,67)" rx="2" ry="2" />
+<text  x="452.66" y="1153.5" >androidx.compose.foundation.AndroidOverscroll_androi..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListScrollPosition.update (10,819,393 ns, 0.22%)</title><rect x="167.2" y="855" width="3.9" height="15.0" fill="rgb(242,111,111)" rx="2" ry="2" />
+<text  x="170.20" y="865.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.internal.DispatchedContinuation.&lt;init&gt; (16,720,882 ns, 0.34%)</title><rect x="986.9" y="663" width="6.0" height="15.0" fill="rgb(231,95,95)" rx="2" ry="2" />
+<text  x="989.86" y="673.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.placeAt-f8xVGno (294,668,411 ns, 5.95%)</title><rect x="260.5" y="1639" width="105.9" height="15.0" fill="rgb(236,103,103)" rx="2" ry="2" />
+<text  x="263.49" y="1649.5" >androidx.co..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutModifierNodeCoordinator.placeAt-f8xVGno (508,105,553 ns, 10.26%)</title><rect x="212.1" y="1223" width="182.5" height="15.0" fill="rgb(221,80,80)" rx="2" ry="2" />
+<text  x="215.08" y="1233.5" >androidx.compose.ui.n..</text>
+</g>
+<g >
+<title>[DEDUPED] ?.plus (8,984,758 ns, 0.18%)</title><rect x="1008.6" y="567" width="3.2" height="15.0" fill="rgb(215,72,72)" rx="2" ry="2" />
+<text  x="1011.59" y="577.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.Recomposer$runRecomposeAndApplyChanges$2.invokeSuspend (566,961,222 ns, 11.44%)</title><rect x="1269.3" y="695" width="203.7" height="15.0" fill="rgb(211,67,67)" rx="2" ry="2" />
+<text  x="1272.33" y="705.5" >androidx.compose.runtime..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.MeasureAndLayoutDelegate.requestRelayout (18,688,046 ns, 0.38%)</title><rect x="1544.6" y="695" width="6.8" height="15.0" fill="rgb(203,54,54)" rx="2" ry="2" />
+<text  x="1547.64" y="705.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotKt.overwritableRecord (5,901,488 ns, 0.12%)</title><rect x="169.0" y="887" width="2.1" height="15.0" fill="rgb(234,100,100)" rx="2" ry="2" />
+<text  x="171.96" y="897.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.platform.RenderNodeApi29.getTop (7,868,651 ns, 0.16%)</title><rect x="361.2" y="1703" width="2.8" height="15.0" fill="rgb(235,101,101)" rx="2" ry="2" />
+<text  x="364.20" y="1713.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.placeOuterCoordinator-f8xVGno (537,053,996 ns, 10.84%)</title><rect x="1578.3" y="599" width="193.0" height="15.0" fill="rgb(233,98,98)" rx="2" ry="2" />
+<text  x="1581.34" y="609.5" >androidx.compose.ui.nod..</text>
+</g>
+<g >
+<title>com.android.internal.os.RuntimeInit$MethodAndArgsCaller.run (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="231" width="1779.3" height="15.0" fill="rgb(238,106,106)" rx="2" ry="2" />
+<text  x="13.00" y="241.5" >com.android.internal.os.RuntimeInit$MethodAndArgsCaller.run</text>
+</g>
+<g >
+<title>androidx.compose.foundation.benchmark.lazy.ListRemeasureTestCase$beforeToggle$1.create (8,852,232 ns, 0.18%)</title><rect x="979.8" y="631" width="3.2" height="15.0" fill="rgb(229,93,93)" rx="2" ry="2" />
+<text  x="982.79" y="641.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.AbstractCoroutine.&lt;init&gt; (26,556,695 ns, 0.54%)</title><rect x="1052.0" y="727" width="9.6" height="15.0" fill="rgb(251,124,124)" rx="2" ry="2" />
+<text  x="1055.01" y="737.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.initParentJob (11,802,976 ns, 0.24%)</title><rect x="1057.3" y="743" width="4.3" height="15.0" fill="rgb(245,116,116)" rx="2" ry="2" />
+<text  x="1060.32" y="753.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.layout.LazyLayoutBeyondBoundsStateKt.calculateLazyLayoutPinnedIndices (14,753,719 ns, 0.30%)</title><rect x="786.8" y="1319" width="5.3" height="15.0" fill="rgb(212,68,68)" rx="2" ry="2" />
+<text  x="789.82" y="1329.5" ></text>
+</g>
+<g >
+<title>kotlin.coroutines.CombinedContext.fold (9,835,813 ns, 0.20%)</title><rect x="989.0" y="679" width="3.5" height="15.0" fill="rgb(247,118,118)" rx="2" ry="2" />
+<text  x="991.98" y="689.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.placeOuterCoordinator-f8xVGno (277,349,031 ns, 5.60%)</title><rect x="266.5" y="1655" width="99.6" height="15.0" fill="rgb(233,98,98)" rx="2" ry="2" />
+<text  x="269.50" y="1665.5" >androidx.c..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.gestures.DefaultScrollableState$scroll$2$1.invoke (160,079,599 ns, 3.23%)</title><rect x="1082.4" y="823" width="57.5" height="15.0" fill="rgb(215,71,71)" rx="2" ry="2" />
+<text  x="1085.41" y="833.5" >andro..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LookaheadCapablePlaceable$layout$1.placeChildren (461,187,756 ns, 9.31%)</title><rect x="1598.5" y="839" width="165.7" height="15.0" fill="rgb(231,96,96)" rx="2" ry="2" />
+<text  x="1601.48" y="849.5" >androidx.compose.ui..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.DepthSortedSet.add (6,885,070 ns, 0.14%)</title><rect x="1547.8" y="711" width="2.5" height="15.0" fill="rgb(254,129,129)" rx="2" ry="2" />
+<text  x="1550.82" y="721.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.DerivedSnapshotState.getCurrentRecord (38,689,273 ns, 0.78%)</title><rect x="815.9" y="1399" width="13.9" height="15.0" fill="rgb(231,96,96)" rx="2" ry="2" />
+<text  x="818.91" y="1409.5" ></text>
+</g>
+<g >
+<title>java.util.HashMap.newNode (13,770,135 ns, 0.28%)</title><rect x="735.0" y="1399" width="4.9" height="15.0" fill="rgb(233,99,99)" rx="2" ry="2" />
+<text  x="737.97" y="1409.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.intrinsics.CancellableKt.startCoroutineCancellable$default (63,932,787 ns, 1.29%)</title><rect x="973.1" y="583" width="22.9" height="15.0" fill="rgb(246,117,117)" rx="2" ry="2" />
+<text  x="976.08" y="593.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.DerivedSnapshotState.currentRecord (5,901,487 ns, 0.12%)</title><rect x="802.8" y="1351" width="2.2" height="15.0" fill="rgb(243,113,113)" rx="2" ry="2" />
+<text  x="805.84" y="1361.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$ObservedScopeMap.observe (390,815,485 ns, 7.89%)</title><rect x="1615.8" y="1127" width="140.4" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="1618.80" y="1137.5" >androidx.compose..</text>
+</g>
+<g >
+<title>android.view.ViewGroup.onDescendantInvalidated (18,688,045 ns, 0.38%)</title><rect x="349.2" y="1735" width="6.7" height="15.0" fill="rgb(236,103,103)" rx="2" ry="2" />
+<text  x="352.19" y="1745.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.AlignmentLines.recalculateQueryOwner (10,819,395 ns, 0.22%)</title><rect x="1671.6" y="1383" width="3.9" height="15.0" fill="rgb(215,72,72)" rx="2" ry="2" />
+<text  x="1674.64" y="1393.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.flow.StateFlowImpl.updateState (5,901,488 ns, 0.12%)</title><rect x="1464.4" y="759" width="2.1" height="15.0" fill="rgb(249,121,121)" rx="2" ry="2" />
+<text  x="1467.37" y="769.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.EventLoopImplBase.shutdown (41,710,047 ns, 0.84%)</title><rect x="90.4" y="599" width="15.0" height="15.0" fill="rgb(224,85,85)" rx="2" ry="2" />
+<text  x="93.37" y="609.5" ></text>
+</g>
+<g >
+<title>kotlin.coroutines.CombinedContext.plus (11,802,976 ns, 0.24%)</title><rect x="125.9" y="727" width="4.2" height="15.0" fill="rgb(246,118,118)" rx="2" ry="2" />
+<text  x="128.85" y="737.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.Snapshot$Companion.observe (379,996,090 ns, 7.67%)</title><rect x="1619.0" y="1143" width="136.5" height="15.0" fill="rgb(252,126,126)" rx="2" ry="2" />
+<text  x="1621.98" y="1153.5" >androidx.compos..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.GlobalSnapshot.&lt;init&gt; (15,035,833 ns, 0.30%)</title><rect x="1484.2" y="583" width="5.4" height="15.0" fill="rgb(213,69,69)" rx="2" ry="2" />
+<text  x="1487.21" y="593.5" ></text>
+</g>
+<g >
+<title>unknown (18,401,166 ns, 0.37%)</title><rect x="605.7" y="1399" width="6.6" height="15.0" fill="rgb(248,120,120)" rx="2" ry="2" />
+<text  x="608.70" y="1409.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$readObserver$1.invoke (79,016,108 ns, 1.59%)</title><rect x="805.3" y="1367" width="28.4" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="808.31" y="1377.5" >a..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.placeAt-f8xVGno (251,182,489 ns, 5.07%)</title><rect x="1651.1" y="1319" width="90.3" height="15.0" fill="rgb(236,103,103)" rx="2" ry="2" />
+<text  x="1654.14" y="1329.5" >androidx...</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.forEachChildAlignmentLinesOwner (23,605,951 ns, 0.48%)</title><rect x="379.1" y="1511" width="8.5" height="15.0" fill="rgb(206,59,59)" rx="2" ry="2" />
+<text  x="382.09" y="1521.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNode.forceRemeasure (2,036,162,719 ns, 41.10%)</title><rect x="171.1" y="855" width="731.6" height="15.0" fill="rgb(235,100,100)" rx="2" ry="2" />
+<text  x="174.08" y="865.5" >androidx.compose.ui.node.LayoutNode.forceRemeasure</text>
+</g>
+<g >
+<title>kotlinx.coroutines.internal.ScopeCoroutine.&lt;init&gt; (26,556,695 ns, 0.54%)</title><rect x="124.8" y="695" width="9.5" height="15.0" fill="rgb(217,75,75)" rx="2" ry="2" />
+<text  x="127.79" y="705.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.EventLoopImplBase.rescheduleAllDelayed (16,720,882 ns, 0.34%)</title><rect x="99.3" y="615" width="6.1" height="15.0" fill="rgb(227,90,90)" rx="2" ry="2" />
+<text  x="102.35" y="625.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotKt.readable (5,901,487 ns, 0.12%)</title><rect x="70.4" y="551" width="2.1" height="15.0" fill="rgb(246,117,117)" rx="2" ry="2" />
+<text  x="73.43" y="561.5" ></text>
+</g>
+<g >
+<title>java.util.HashMap.put (5,901,488 ns, 0.12%)</title><rect x="831.6" y="1399" width="2.1" height="15.0" fill="rgb(203,54,54)" rx="2" ry="2" />
+<text  x="834.58" y="1409.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.platform.AndroidComposeView.onRequestMeasure (12,786,557 ns, 0.26%)</title><rect x="897.7" y="871" width="4.6" height="15.0" fill="rgb(242,112,112)" rx="2" ry="2" />
+<text  x="900.71" y="881.5" ></text>
+</g>
+<g >
+<title>android.os.Handler.dispatchMessage (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="375" width="1779.3" height="15.0" fill="rgb(203,55,55)" rx="2" ry="2" />
+<text  x="13.00" y="385.5" >android.os.Handler.dispatchMessage</text>
+</g>
+<g >
+<title>androidx.compose.runtime.SnapshotMutableStateImpl.getValue (26,556,696 ns, 0.54%)</title><rect x="367.4" y="1591" width="9.6" height="15.0" fill="rgb(248,120,120)" rx="2" ry="2" />
+<text  x="370.42" y="1601.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.platform.AndroidComposeView.measureAndLayout-0kLqBqw (2,012,556,768 ns, 40.62%)</title><rect x="174.6" y="871" width="723.1" height="15.0" fill="rgb(240,108,108)" rx="2" ry="2" />
+<text  x="177.62" y="881.5" >androidx.compose.ui.platform.AndroidComposeView.measureAndLayout-0kLqBqw</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutModifierNodeCoordinator.measure-BRTryo0 (1,214,910,544 ns, 24.52%)</title><rect x="442.2" y="1079" width="436.5" height="15.0" fill="rgb(201,52,52)" rx="2" ry="2" />
+<text  x="445.24" y="1089.5" >androidx.compose.ui.node.LayoutModifierNodeCoordinator..</text>
+</g>
+<g >
+<title>art_quick_alloc_object_initialized_region_tlab (8,852,229 ns, 0.18%)</title><rect x="735.3" y="1415" width="3.2" height="15.0" fill="rgb(215,72,72)" rx="2" ry="2" />
+<text  x="738.33" y="1425.5" ></text>
+</g>
+<g >
+<title>android.graphics.RenderNode.getLeft (12,786,557 ns, 0.26%)</title><rect x="356.6" y="1719" width="4.6" height="15.0" fill="rgb(206,59,59)" rx="2" ry="2" />
+<text  x="359.61" y="1729.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.tryMakeCompleting (11,802,975 ns, 0.24%)</title><rect x="1147.7" y="807" width="4.2" height="15.0" fill="rgb(213,69,69)" rx="2" ry="2" />
+<text  x="1150.70" y="817.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$readObserver$1.invoke (12,351,015 ns, 0.25%)</title><rect x="1744.2" y="1303" width="4.5" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="1747.21" y="1313.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.MutatorMutex$mutateWith$2.invoke (199,422,851 ns, 4.03%)</title><rect x="1076.0" y="791" width="71.7" height="15.0" fill="rgb(206,59,59)" rx="2" ry="2" />
+<text  x="1079.04" y="801.5" >android..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.tryMakeCompleting (12,786,557 ns, 0.26%)</title><rect x="1161.8" y="663" width="4.6" height="15.0" fill="rgb(213,69,69)" rx="2" ry="2" />
+<text  x="1164.83" y="673.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.LayoutModifierImpl.measure-3p2s80s (1,180,857,886 ns, 23.84%)</title><rect x="447.2" y="1127" width="424.3" height="15.0" fill="rgb(254,129,129)" rx="2" ry="2" />
+<text  x="450.18" y="1137.5" >androidx.compose.ui.layout.LayoutModifierImpl.measure..</text>
+</g>
+<g >
+<title>art::JValue art::InvokeWithVarArgs&lt;art::ArtMethod*&gt;(art::ScopedObjectAccessAlreadyRunnable const&amp;, _jobject*, art::ArtMethod*, std::__va_list) (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="167" width="1779.3" height="15.0" fill="rgb(207,207,61)" rx="2" ry="2" />
+<text  x="13.00" y="177.5" >art::JValue art::InvokeWithVarArgs&lt;art::ArtMethod*&gt;(art::ScopedObjectAccessAlreadyRunnable const&amp;, _jobject*, art::ArtMethod*, std::__va_list)</text>
+</g>
+<g >
+<title>androidx.compose.foundation.AndroidOverscroll_androidKt$StretchOverscrollNonClippingLayer$2$1.invoke (493,351,835 ns, 9.96%)</title><rect x="216.7" y="1351" width="177.2" height="15.0" fill="rgb(205,58,58)" rx="2" ry="2" />
+<text  x="219.67" y="1361.5" >androidx.compose.foun..</text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.Placeable$PlacementScope.placeRelative (476,925,057 ns, 9.63%)</title><rect x="1596.0" y="743" width="171.4" height="15.0" fill="rgb(250,123,123)" rx="2" ry="2" />
+<text  x="1599.01" y="753.5" >androidx.compose.ui...</text>
+</g>
+<g >
+<title>java.util.concurrent.FutureTask.run (4,947,410,068 ns, 99.86%)</title><rect x="10.0" y="439" width="1777.6" height="15.0" fill="rgb(235,102,102)" rx="2" ry="2" />
+<text  x="13.00" y="449.5" >java.util.concurrent.FutureTask.run</text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.Placeable$PlacementScope.placeWithLayer (502,204,066 ns, 10.14%)</title><rect x="214.2" y="1303" width="180.4" height="15.0" fill="rgb(249,121,121)" rx="2" ry="2" />
+<text  x="217.20" y="1313.5" >androidx.compose.ui.l..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.layout.PaddingKt.calculateStartPadding (5,901,488 ns, 0.12%)</title><rect x="513.3" y="1319" width="2.1" height="15.0" fill="rgb(250,122,122)" rx="2" ry="2" />
+<text  x="516.27" y="1329.5" ></text>
+</g>
+<g >
+<title>unknown (12,786,557 ns, 0.26%)</title><rect x="607.7" y="1447" width="4.6" height="15.0" fill="rgb(248,120,120)" rx="2" ry="2" />
+<text  x="610.72" y="1457.5" ></text>
+</g>
+<g >
+<title>art::ArtMethod::Invoke(art::Thread*, unsigned int*, unsigned int, art::JValue*, char const*) (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="295" width="1779.3" height="15.0" fill="rgb(186,186,54)" rx="2" ry="2" />
+<text  x="13.00" y="305.5" >art::ArtMethod::Invoke(art::Thread*, unsigned int*, unsigned int, art::JValue*, char const*)</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.MeasureAndLayoutDelegate.doRemeasure-sdFAvZA (1,355,039,785 ns, 27.35%)</title><rect x="398.5" y="903" width="486.8" height="15.0" fill="rgb(201,51,51)" rx="2" ry="2" />
+<text  x="401.49" y="913.5" >androidx.compose.ui.node.MeasureAndLayoutDelegate.doRemeasure..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.sync.MutexImpl.unlock (24,589,534 ns, 0.50%)</title><rect x="925.4" y="807" width="8.8" height="15.0" fill="rgb(241,110,110)" rx="2" ry="2" />
+<text  x="928.40" y="817.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListKt$rememberLazyListMeasurePolicy$1$1$3.invoke (8,852,232 ns, 0.18%)</title><rect x="548.3" y="1335" width="3.1" height="15.0" fill="rgb(225,87,87)" rx="2" ry="2" />
+<text  x="551.25" y="1345.5" ></text>
+</g>
+<g >
+<title>android.view.ViewGroup.onDescendantInvalidated (11,802,976 ns, 0.24%)</title><rect x="351.7" y="1751" width="4.2" height="15.0" fill="rgb(236,103,103)" rx="2" ry="2" />
+<text  x="354.66" y="1761.5" ></text>
+</g>
+<g >
+<title>android.graphics.RenderNode.getLeft (10,819,395 ns, 0.22%)</title><rect x="1734.7" y="1399" width="3.9" height="15.0" fill="rgb(206,59,59)" rx="2" ry="2" />
+<text  x="1737.67" y="1409.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.OnPositionedDispatcher.dispatchHierarchy (39,343,253 ns, 0.79%)</title><rect x="1773.1" y="567" width="14.1" height="15.0" fill="rgb(226,88,88)" rx="2" ry="2" />
+<text  x="1776.07" y="577.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.attachChild (5,901,487 ns, 0.12%)</title><rect x="142.1" y="807" width="2.1" height="15.0" fill="rgb(242,111,111)" rx="2" ry="2" />
+<text  x="145.11" y="817.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.platform.AndroidComposeView$snapshotObserver$1.invoke (86,555,155 ns, 1.75%)</title><rect x="1525.9" y="583" width="31.1" height="15.0" fill="rgb(242,111,111)" rx="2" ry="2" />
+<text  x="1528.91" y="593.5" >an..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.DerivedSnapshotState.getValue (90,819,083 ns, 1.83%)</title><rect x="801.1" y="1335" width="32.6" height="15.0" fill="rgb(239,107,107)" rx="2" ry="2" />
+<text  x="804.07" y="1345.5" >an..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.makeCompletingOnce$kotlinx_coroutines_core (5,901,488 ns, 0.12%)</title><rect x="963.9" y="647" width="2.1" height="15.0" fill="rgb(239,107,107)" rx="2" ry="2" />
+<text  x="966.89" y="657.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LookaheadCapablePlaceable.invalidateAlignmentLinesFromPositionChange (28,523,858 ns, 0.58%)</title><rect x="1690.4" y="1367" width="10.2" height="15.0" fill="rgb(236,103,103)" rx="2" ry="2" />
+<text  x="1693.37" y="1377.5" ></text>
+</g>
+<g >
+<title>kotlin.coroutines.CombinedContext.plus (6,885,068 ns, 0.14%)</title><rect x="1054.8" y="743" width="2.5" height="15.0" fill="rgb(246,118,118)" rx="2" ry="2" />
+<text  x="1057.84" y="753.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.NodeCoordinator.onPlaced (11,802,975 ns, 0.24%)</title><rect x="389.3" y="1399" width="4.3" height="15.0" fill="rgb(239,107,107)" rx="2" ry="2" />
+<text  x="392.33" y="1409.5" ></text>
+</g>
+<g >
+<title>art_jni_trampoline (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="247" width="1779.3" height="15.0" fill="rgb(254,128,128)" rx="2" ry="2" />
+<text  x="13.00" y="257.5" >art_jni_trampoline</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.remeasure-BRTryo0 (1,346,473,048 ns, 27.18%)</title><rect x="401.6" y="919" width="483.7" height="15.0" fill="rgb(229,92,92)" rx="2" ry="2" />
+<text  x="404.57" y="929.5" >androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePass..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutModifierNodeCoordinator.placeAt-f8xVGno (524,826,434 ns, 10.59%)</title><rect x="207.1" y="1079" width="188.6" height="15.0" fill="rgb(221,80,80)" rx="2" ry="2" />
+<text  x="210.13" y="1089.5" >androidx.compose.ui.no..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.EventLoopImplBase.processNextEvent (411,232,163 ns, 8.30%)</title><rect x="1022.3" y="583" width="147.8" height="15.0" fill="rgb(231,95,95)" rx="2" ry="2" />
+<text  x="1025.33" y="593.5" >kotlinx.coroutine..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.DerivedSnapshotState.currentRecord (32,787,785 ns, 0.66%)</title><rect x="817.3" y="1415" width="11.8" height="15.0" fill="rgb(243,113,113)" rx="2" ry="2" />
+<text  x="820.32" y="1425.5" ></text>
+</g>
+<g >
+<title>kotlin.coroutines.jvm.internal.ContinuationImpl.releaseIntercepted (9,835,814 ns, 0.20%)</title><rect x="958.6" y="631" width="3.5" height="15.0" fill="rgb(242,111,111)" rx="2" ry="2" />
+<text  x="961.59" y="641.5" ></text>
+</g>
+<g >
+<title>[DEDUPED] ?.fold (5,901,488 ns, 0.12%)</title><rect x="970.3" y="599" width="2.1" height="15.0" fill="rgb(215,72,72)" rx="2" ry="2" />
+<text  x="973.25" y="609.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.internal.ScopeCoroutine.&lt;init&gt; (10,819,393 ns, 0.22%)</title><rect x="1068.6" y="775" width="3.9" height="15.0" fill="rgb(217,75,75)" rx="2" ry="2" />
+<text  x="1071.62" y="785.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.tryFinalizeSimpleState (9,835,813 ns, 0.20%)</title><rect x="1162.9" y="679" width="3.5" height="15.0" fill="rgb(222,83,83)" rx="2" ry="2" />
+<text  x="1165.89" y="689.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.flow.StateFlowImpl.setValue (8,852,232 ns, 0.18%)</title><rect x="1239.3" y="615" width="3.2" height="15.0" fill="rgb(232,97,97)" rx="2" ry="2" />
+<text  x="1242.29" y="625.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.DispatchedTaskKt.dispatch (604,965,933 ns, 12.21%)</title><rect x="1255.9" y="631" width="217.4" height="15.0" fill="rgb(214,71,71)" rx="2" ry="2" />
+<text  x="1258.90" y="641.5" >kotlinx.coroutines.Dispatc..</text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.LayoutModifierImpl.measure-3p2s80s (1,144,465,381 ns, 23.10%)</title><rect x="456.4" y="1191" width="411.2" height="15.0" fill="rgb(254,129,129)" rx="2" ry="2" />
+<text  x="459.37" y="1201.5" >androidx.compose.ui.layout.LayoutModifierImpl.measu..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.CancellableContinuationImpl.resumeWith (646,276,348 ns, 13.04%)</title><rect x="1242.8" y="599" width="232.2" height="15.0" fill="rgb(246,117,117)" rx="2" ry="2" />
+<text  x="1245.82" y="609.5" >kotlinx.coroutines.Cancellab..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.CoroutineContextKt.foldCopies (11,802,975 ns, 0.24%)</title><rect x="1172.3" y="583" width="4.2" height="15.0" fill="rgb(212,68,68)" rx="2" ry="2" />
+<text  x="1175.29" y="593.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.fold (9,835,813 ns, 0.20%)</title><rect x="81.0" y="583" width="3.6" height="15.0" fill="rgb(209,64,64)" rx="2" ry="2" />
+<text  x="84.03" y="593.5" ></text>
+</g>
+<g >
+<title>kotlin.coroutines.jvm.internal.BaseContinuationImpl.resumeWith (579,747,779 ns, 11.70%)</title><rect x="1264.7" y="679" width="208.3" height="15.0" fill="rgb(231,96,96)" rx="2" ry="2" />
+<text  x="1267.73" y="689.5" >kotlin.coroutines.jvm.int..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListMeasuredItemProvider.getAndMeasure (496,547,286 ns, 10.02%)</title><rect x="563.2" y="1335" width="178.4" height="15.0" fill="rgb(239,107,107)" rx="2" ry="2" />
+<text  x="566.16" y="1345.5" >androidx.compose.foun..</text>
+</g>
+<g >
+<title>[DEDUPED] ?.get (91,802,664 ns, 1.85%)</title><rect x="800.7" y="1319" width="33.0" height="15.0" fill="rgb(218,76,76)" rx="2" ry="2" />
+<text  x="803.71" y="1329.5" >[D..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.benchmark.lazy.ListRemeasureTestCase.beforeToggle (2,590,508,475 ns, 52.29%)</title><rect x="68.7" y="519" width="930.7" height="15.0" fill="rgb(217,74,74)" rx="2" ry="2" />
+<text  x="71.66" y="529.5" >androidx.compose.foundation.benchmark.lazy.ListRemeasureTestCase.beforeToggle</text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.LayoutNodeSubcompositionsState.subcompose (75,174,146 ns, 1.52%)</title><rect x="666.5" y="1383" width="27.0" height="15.0" fill="rgb(254,128,128)" rx="2" ry="2" />
+<text  x="669.54" y="1393.5" >a..</text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.Placeable$PlacementScope.placeWithLayer$default (454,302,688 ns, 9.17%)</title><rect x="1600.3" y="967" width="163.2" height="15.0" fill="rgb(228,90,90)" rx="2" ry="2" />
+<text  x="1603.25" y="977.5" >androidx.compose.ui..</text>
+</g>
+<g >
+<title>[DEDUPED] (15,905,432 ns, 0.32%)</title><rect x="1516.2" y="615" width="5.7" height="15.0" fill="rgb(249,121,121)" rx="2" ry="2" />
+<text  x="1519.21" y="625.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListScrollPosition.update (9,835,812 ns, 0.20%)</title><rect x="758.5" y="1367" width="3.5" height="15.0" fill="rgb(242,111,111)" rx="2" ry="2" />
+<text  x="761.48" y="1377.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.MutableSnapshot.recordModified$runtime_release (7,006,429 ns, 0.14%)</title><rect x="1117.0" y="999" width="2.6" height="15.0" fill="rgb(242,111,111)" rx="2" ry="2" />
+<text  x="1120.04" y="1009.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.MeasureAndLayoutDelegate.measureAndLayout (578,364,411 ns, 11.67%)</title><rect x="1563.9" y="551" width="207.8" height="15.0" fill="rgb(215,71,71)" rx="2" ry="2" />
+<text  x="1566.85" y="561.5" >androidx.compose.ui.node...</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate$layoutChildrenBlock$1.invoke (377,045,347 ns, 7.61%)</title><rect x="1619.7" y="1159" width="135.5" height="15.0" fill="rgb(201,52,52)" rx="2" ry="2" />
+<text  x="1622.69" y="1169.5" >androidx.compos..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.EventLoop.decrementUseCount (21,374,706 ns, 0.43%)</title><rect x="1014.6" y="583" width="7.7" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="1017.65" y="593.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$ObservedScopeMap.recordRead (9,400,271 ns, 0.19%)</title><rect x="1745.3" y="1335" width="3.4" height="15.0" fill="rgb(243,113,113)" rx="2" ry="2" />
+<text  x="1748.27" y="1345.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.graphics.SimpleGraphicsLayerModifier$measure$1.invoke (513,023,460 ns, 10.36%)</title><rect x="210.7" y="1175" width="184.3" height="15.0" fill="rgb(237,105,105)" rx="2" ry="2" />
+<text  x="213.66" y="1185.5" >androidx.compose.ui.gr..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListMeasureKt$measureLazyList$7.invoke (332,384,196 ns, 6.71%)</title><rect x="1629.9" y="1239" width="119.5" height="15.0" fill="rgb(230,93,93)" rx="2" ry="2" />
+<text  x="1632.94" y="1249.5" >androidx.comp..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.intrinsics.CancellableKt.startCoroutineCancellable (47,783,148 ns, 0.96%)</title><rect x="1178.3" y="599" width="17.2" height="15.0" fill="rgb(212,68,68)" rx="2" ry="2" />
+<text  x="1181.30" y="609.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.NodeCoordinator.updateLayerBlock (7,868,650 ns, 0.16%)</title><rect x="1700.6" y="1367" width="2.8" height="15.0" fill="rgb(232,96,96)" rx="2" ry="2" />
+<text  x="1703.61" y="1377.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.AndroidOverscroll_androidKt$StretchOverscrollNonClippingLayer$1$1.invoke (503,187,647 ns, 10.16%)</title><rect x="213.8" y="1271" width="180.8" height="15.0" fill="rgb(212,68,68)" rx="2" ry="2" />
+<text  x="216.85" y="1281.5" >androidx.compose.foun..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$ObservedScopeMap.observe (446,139,934 ns, 9.01%)</title><rect x="227.6" y="1447" width="160.3" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="230.63" y="1457.5" >androidx.compose.r..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.attachChild (6,885,069 ns, 0.14%)</title><rect x="131.5" y="743" width="2.5" height="15.0" fill="rgb(242,111,111)" rx="2" ry="2" />
+<text  x="134.51" y="753.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutModifierNodeCoordinator.measure-BRTryo0 (1,285,728,397 ns, 25.95%)</title><rect x="421.7" y="1015" width="462.0" height="15.0" fill="rgb(201,52,52)" rx="2" ry="2" />
+<text  x="424.74" y="1025.5" >androidx.compose.ui.node.LayoutModifierNodeCoordinator.mea..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.CoroutineContextKt.newCoroutineContext (17,704,464 ns, 0.36%)</title><rect x="966.7" y="567" width="6.4" height="15.0" fill="rgb(210,65,65)" rx="2" ry="2" />
+<text  x="969.72" y="577.5" ></text>
+</g>
+<g >
+<title>atrace_int_body (18,654,336 ns, 0.38%)</title><rect x="616.2" y="1415" width="6.7" height="15.0" fill="rgb(237,104,104)" rx="2" ry="2" />
+<text  x="619.20" y="1425.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.CompositionImpl.addPendingInvalidationsLocked (219,221,887 ns, 4.42%)</title><rect x="1378.5" y="759" width="78.7" height="15.0" fill="rgb(231,96,96)" rx="2" ry="2" />
+<text  x="1381.46" y="769.5" >androidx..</text>
+</g>
+<g >
+<title>android.view.ViewGroup.onDescendantInvalidated (37,376,092 ns, 0.75%)</title><rect x="1720.2" y="1383" width="13.4" height="15.0" fill="rgb(236,103,103)" rx="2" ry="2" />
+<text  x="1723.18" y="1393.5" ></text>
+</g>
+<g >
+<title>java.util.concurrent.Executors$RunnableAdapter.call (4,947,410,068 ns, 99.86%)</title><rect x="10.0" y="423" width="1777.6" height="15.0" fill="rgb(212,68,68)" rx="2" ry="2" />
+<text  x="13.00" y="433.5" >java.util.concurrent.Executors$RunnableAdapter.call</text>
+</g>
+<g >
+<title>kotlin.coroutines.jvm.internal.ContinuationImpl.intercepted (20,242,872 ns, 0.41%)</title><rect x="1182.9" y="631" width="7.3" height="15.0" fill="rgb(246,118,118)" rx="2" ry="2" />
+<text  x="1185.89" y="641.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.SnapshotMutableStateImpl.setValue (30,491,020 ns, 0.62%)</title><rect x="1128.6" y="855" width="11.0" height="15.0" fill="rgb(217,76,76)" rx="2" ry="2" />
+<text  x="1131.61" y="865.5" ></text>
+</g>
+<g >
+<title>kotlin.coroutines.jvm.internal.BaseContinuationImpl.resumeWith (369,582,413 ns, 7.46%)</title><rect x="1034.0" y="615" width="132.8" height="15.0" fill="rgb(231,96,96)" rx="2" ry="2" />
+<text  x="1036.99" y="625.5" >kotlin.coroutin..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.CancellableContinuationImpl.getResult (7,576,651 ns, 0.15%)</title><rect x="1304.3" y="727" width="2.7" height="15.0" fill="rgb(203,54,54)" rx="2" ry="2" />
+<text  x="1307.31" y="737.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.internal.DispatchedContinuationKt.resumeCancellableWith (14,753,720 ns, 0.30%)</title><rect x="1190.2" y="615" width="5.3" height="15.0" fill="rgb(229,92,92)" rx="2" ry="2" />
+<text  x="1193.17" y="625.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.onNodePlaced$ui_release (20,655,208 ns, 0.42%)</title><rect x="1668.1" y="1351" width="7.4" height="15.0" fill="rgb(203,55,55)" rx="2" ry="2" />
+<text  x="1671.10" y="1361.5" ></text>
+</g>
+<g >
+<title>[DEDUPED] androidx.compose.ui.layout.Placeable$PlacementScope.? (267,903,372 ns, 5.41%)</title><rect x="1645.1" y="1303" width="96.3" height="15.0" fill="rgb(207,60,60)" rx="2" ry="2" />
+<text  x="1648.13" y="1313.5" >[DEDUPED] ..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.JobSupport.fold (10,819,395 ns, 0.22%)</title><rect x="126.2" y="743" width="3.9" height="15.0" fill="rgb(209,64,64)" rx="2" ry="2" />
+<text  x="129.20" y="753.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListState.applyMeasureResult$foundation_release (80,849,923 ns, 1.63%)</title><rect x="753.5" y="1335" width="29.1" height="15.0" fill="rgb(244,115,115)" rx="2" ry="2" />
+<text  x="756.53" y="1345.5" >a..</text>
+</g>
+<g >
+<title>art_jni_trampoline (8,852,232 ns, 0.18%)</title><rect x="779.0" y="1447" width="3.2" height="15.0" fill="rgb(254,128,128)" rx="2" ry="2" />
+<text  x="782.04" y="1457.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListState.getFirstVisibleItemIndex (8,852,232 ns, 0.18%)</title><rect x="782.6" y="1319" width="3.2" height="15.0" fill="rgb(216,74,74)" rx="2" ry="2" />
+<text  x="785.58" y="1329.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.DerivedSnapshotState.getValue (9,835,812 ns, 0.20%)</title><rect x="509.7" y="1351" width="3.6" height="15.0" fill="rgb(239,107,107)" rx="2" ry="2" />
+<text  x="512.73" y="1361.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.gestures.DefaultScrollableState$scrollScope$1.scrollBy (104,999,047 ns, 2.12%)</title><rect x="1089.8" y="887" width="37.8" height="15.0" fill="rgb(225,87,87)" rx="2" ry="2" />
+<text  x="1092.83" y="897.5" >an..</text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.Placeable$PlacementScope.placeRelativeWithLayer-aW-9-wM$default (274,788,441 ns, 5.55%)</title><rect x="1642.7" y="1287" width="98.7" height="15.0" fill="rgb(234,100,100)" rx="2" ry="2" />
+<text  x="1645.66" y="1297.5" >androidx.c..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotKt.current (5,901,488 ns, 0.12%)</title><rect x="1133.2" y="871" width="2.1" height="15.0" fill="rgb(236,102,102)" rx="2" ry="2" />
+<text  x="1136.21" y="881.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.Snapshot$Companion.createNonObservableSnapshot (8,852,232 ns, 0.18%)</title><rect x="792.6" y="1319" width="3.2" height="15.0" fill="rgb(233,99,99)" rx="2" ry="2" />
+<text  x="795.59" y="1329.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.Placeable$PlacementScope.placeRelative (527,562,481 ns, 10.65%)</title><rect x="206.4" y="1063" width="189.6" height="15.0" fill="rgb(250,123,123)" rx="2" ry="2" />
+<text  x="209.42" y="1073.5" >androidx.compose.ui.la..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.gestures.DefaultScrollableState$scroll$2.invokeSuspend (2,261,668,196 ns, 45.65%)</title><rect x="136.8" y="727" width="812.6" height="15.0" fill="rgb(249,122,122)" rx="2" ry="2" />
+<text  x="139.81" y="737.5" >androidx.compose.foundation.gestures.DefaultScrollableState$scroll$2.invokeSuspend</text>
+</g>
+<g >
+<title>kotlinx.coroutines.CoroutineScopeKt.coroutineScope (2,320,683,073 ns, 46.84%)</title><rect x="122.3" y="679" width="833.8" height="15.0" fill="rgb(222,83,83)" rx="2" ry="2" />
+<text  x="125.32" y="689.5" >kotlinx.coroutines.CoroutineScopeKt.coroutineScope</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotKt.overwritableRecord (31,474,602 ns, 0.64%)</title><rect x="770.9" y="1367" width="11.3" height="15.0" fill="rgb(234,100,100)" rx="2" ry="2" />
+<text  x="773.91" y="1377.5" ></text>
+</g>
+<g >
+<title>android.view.ViewGroup.onDescendantInvalidated (33,441,765 ns, 0.68%)</title><rect x="343.9" y="1703" width="12.0" height="15.0" fill="rgb(236,103,103)" rx="2" ry="2" />
+<text  x="346.89" y="1713.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.DispatchedTask.run (400,412,769 ns, 8.08%)</title><rect x="1025.5" y="599" width="143.9" height="15.0" fill="rgb(224,85,85)" rx="2" ry="2" />
+<text  x="1028.51" y="609.5" >kotlinx.coroutin..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$ObservedScopeMap.recordRead (68,196,713 ns, 1.38%)</title><rect x="809.2" y="1383" width="24.5" height="15.0" fill="rgb(243,113,113)" rx="2" ry="2" />
+<text  x="812.20" y="1393.5" >a..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$readObserver$1.invoke (11,802,976 ns, 0.24%)</title><rect x="836.9" y="1335" width="4.2" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="839.88" y="1345.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$sendNotifications$1.invoke (74,752,180 ns, 1.51%)</title><rect x="1530.2" y="631" width="26.8" height="15.0" fill="rgb(212,68,68)" rx="2" ry="2" />
+<text  x="1533.16" y="641.5" >a..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.gestures.DefaultScrollableState.scroll (302,698,884 ns, 6.11%)</title><rect x="1047.4" y="679" width="108.8" height="15.0" fill="rgb(213,70,70)" rx="2" ry="2" />
+<text  x="1050.42" y="689.5" >androidx.com..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.benchmark.lazy.ListRemeasureTestCase.toggle (550,609,779 ns, 11.11%)</title><rect x="999.4" y="519" width="197.8" height="15.0" fill="rgb(210,64,64)" rx="2" ry="2" />
+<text  x="1002.41" y="529.5" >androidx.compose.founda..</text>
+</g>
+<g >
+<title>unknown (17,417,585 ns, 0.35%)</title><rect x="606.1" y="1415" width="6.2" height="15.0" fill="rgb(248,120,120)" rx="2" ry="2" />
+<text  x="609.06" y="1425.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.SnapshotMutableStateImpl.setValue (48,391,740 ns, 0.98%)</title><rect x="765.2" y="1351" width="17.4" height="15.0" fill="rgb(217,76,76)" rx="2" ry="2" />
+<text  x="768.19" y="1361.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.OnPositionedDispatcher.dispatchHierarchy (10,819,395 ns, 0.22%)</title><rect x="1783.3" y="583" width="3.9" height="15.0" fill="rgb(226,88,88)" rx="2" ry="2" />
+<text  x="1786.31" y="593.5" ></text>
+</g>
+<g >
+<title>PaletteTraceIntegerValue (6,885,070 ns, 0.14%)</title><rect x="1466.5" y="759" width="2.5" height="15.0" fill="rgb(243,113,113)" rx="2" ry="2" />
+<text  x="1469.49" y="769.5" ></text>
+</g>
+<g >
+<title>art_quick_alloc_object_initialized_region_tlab (15,737,300 ns, 0.32%)</title><rect x="721.8" y="1367" width="5.7" height="15.0" fill="rgb(215,72,72)" rx="2" ry="2" />
+<text  x="724.83" y="1377.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotKt.createTransparentSnapshotWithNoParentReadObserver (6,885,069 ns, 0.14%)</title><rect x="855.2" y="1271" width="2.5" height="15.0" fill="rgb(216,74,74)" rx="2" ry="2" />
+<text  x="858.20" y="1281.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.layoutChildren (21,484,438 ns, 0.43%)</title><rect x="282.4" y="1687" width="7.7" height="15.0" fill="rgb(218,76,76)" rx="2" ry="2" />
+<text  x="285.40" y="1697.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$ObservedScopeMap.notifyInvalidatedScopes (58,031,298 ns, 1.17%)</title><rect x="1536.2" y="647" width="20.8" height="15.0" fill="rgb(252,126,126)" rx="2" ry="2" />
+<text  x="1539.16" y="657.5" ></text>
+</g>
+<g >
+<title>com.android.internal.os.ZygoteInit.main (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="215" width="1779.3" height="15.0" fill="rgb(202,54,54)" rx="2" ry="2" />
+<text  x="13.00" y="225.5" >com.android.internal.os.ZygoteInit.main</text>
+</g>
+<g >
+<title>androidx.compose.foundation.gestures.DefaultScrollableState$scroll$2$1.invoke (2,130,391,495 ns, 43.00%)</title><rect x="156.9" y="807" width="765.5" height="15.0" fill="rgb(215,71,71)" rx="2" ry="2" />
+<text  x="159.95" y="817.5" >androidx.compose.foundation.gestures.DefaultScrollableState$scroll$2$1.invoke</text>
+</g>
+<g >
+<title>kotlinx.coroutines.sync.SemaphoreImpl.release (9,835,814 ns, 0.20%)</title><rect x="930.7" y="823" width="3.5" height="15.0" fill="rgb(252,126,126)" rx="2" ry="2" />
+<text  x="933.70" y="833.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate.forEachChildAlignmentLinesOwner (10,902,180 ns, 0.22%)</title><rect x="404.7" y="935" width="4.0" height="15.0" fill="rgb(206,59,59)" rx="2" ry="2" />
+<text  x="407.75" y="945.5" ></text>
+</g>
+<g >
+<title>kotlin.collections.ArraysKt___ArraysJvmKt.copyInto (9,835,813 ns, 0.20%)</title><rect x="778.7" y="1431" width="3.5" height="15.0" fill="rgb(232,97,97)" rx="2" ry="2" />
+<text  x="781.69" y="1441.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.platform.AndroidComposeView.onLayoutChange (32,827,435 ns, 0.66%)</title><rect x="1703.4" y="1367" width="11.8" height="15.0" fill="rgb(237,105,105)" rx="2" ry="2" />
+<text  x="1706.44" y="1377.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.InnerNodeCoordinator.placeAt-f8xVGno (444,466,876 ns, 8.97%)</title><rect x="1602.7" y="1063" width="159.7" height="15.0" fill="rgb(226,88,88)" rx="2" ry="2" />
+<text  x="1605.73" y="1073.5" >androidx.compose.u..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.Recomposer.recordComposerModifications (426,502,275 ns, 8.61%)</title><rect x="1319.8" y="711" width="153.2" height="15.0" fill="rgb(244,114,114)" rx="2" ry="2" />
+<text  x="1322.79" y="721.5" >androidx.compose...</text>
+</g>
+<g >
+<title>kotlinx.coroutines.intrinsics.CancellableKt.startCoroutineCancellable (59,014,880 ns, 1.19%)</title><rect x="974.8" y="599" width="21.2" height="15.0" fill="rgb(212,68,68)" rx="2" ry="2" />
+<text  x="977.85" y="609.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.Placeable$PlacementScope.place (492,368,254 ns, 9.94%)</title><rect x="217.0" y="1367" width="176.9" height="15.0" fill="rgb(248,121,121)" rx="2" ry="2" />
+<text  x="220.03" y="1377.5" >androidx.compose.ui.l..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.DerivedSnapshotState.currentRecord (9,835,813 ns, 0.20%)</title><rect x="823.3" y="1479" width="3.6" height="15.0" fill="rgb(243,113,113)" rx="2" ry="2" />
+<text  x="826.33" y="1489.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.Recomposer.getHasPendingWork (17,704,464 ns, 0.36%)</title><rect x="1200.8" y="535" width="6.3" height="15.0" fill="rgb(251,124,124)" rx="2" ry="2" />
+<text  x="1203.77" y="545.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.AlignmentLines.onAlignmentsChanged (5,901,488 ns, 0.12%)</title><rect x="1697.8" y="1399" width="2.1" height="15.0" fill="rgb(202,53,53)" rx="2" ry="2" />
+<text  x="1700.79" y="1409.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.LayoutNodeSubcompositionsState$createMeasurePolicy$1.measure-3p2s80s (1,021,525,046 ns, 20.62%)</title><rect x="475.8" y="1255" width="367.0" height="15.0" fill="rgb(253,128,128)" rx="2" ry="2" />
+<text  x="478.81" y="1265.5" >androidx.compose.ui.layout.LayoutNodeSubcompo..</text>
+</g>
+<g >
+<title>kotlin.coroutines.CombinedContext.get (8,852,232 ns, 0.18%)</title><rect x="1313.7" y="759" width="3.2" height="15.0" fill="rgb(249,122,122)" rx="2" ry="2" />
+<text  x="1316.75" y="769.5" ></text>
+</g>
+<g >
+<title>android.view.View.invalidate (10,819,395 ns, 0.22%)</title><rect x="1553.1" y="727" width="3.9" height="15.0" fill="rgb(212,68,68)" rx="2" ry="2" />
+<text  x="1556.13" y="737.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.CancellableContinuationImpl.initCancellability (35,507,745 ns, 0.72%)</title><rect x="1307.0" y="727" width="12.8" height="15.0" fill="rgb(232,96,96)" rx="2" ry="2" />
+<text  x="1310.03" y="737.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.layout.Placeable$PlacementScope.placeWithLayer$default (502,204,066 ns, 10.14%)</title><rect x="214.2" y="1287" width="180.4" height="15.0" fill="rgb(228,90,90)" rx="2" ry="2" />
+<text  x="217.20" y="1297.5" >androidx.compose.ui.l..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.EventLoopImplBase.dispatch (6,885,069 ns, 0.14%)</title><rect x="993.6" y="631" width="2.4" height="15.0" fill="rgb(206,59,59)" rx="2" ry="2" />
+<text  x="996.57" y="641.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListMeasureKt.measureLazyList-5IMabDg (651,000,184 ns, 13.14%)</title><rect x="518.9" y="1319" width="233.9" height="15.0" fill="rgb(247,119,119)" rx="2" ry="2" />
+<text  x="521.92" y="1329.5" >androidx.compose.foundation...</text>
+</g>
+<g >
+<title>androidx.compose.foundation.layout.SizeNode.getTargetConstraints-OenEA2s (18,688,045 ns, 0.38%)</title><rect x="430.6" y="1047" width="6.7" height="15.0" fill="rgb(238,105,105)" rx="2" ry="2" />
+<text  x="433.58" y="1057.5" ></text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListState.applyMeasureResult$foundation_release$default (82,817,086 ns, 1.67%)</title><rect x="752.8" y="1319" width="29.8" height="15.0" fill="rgb(223,84,84)" rx="2" ry="2" />
+<text  x="755.82" y="1329.5" >a..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListState$scrollToItem$2.invoke (2,058,785,087 ns, 41.56%)</title><rect x="163.7" y="839" width="739.7" height="15.0" fill="rgb(249,121,121)" rx="2" ry="2" />
+<text  x="166.66" y="849.5" >androidx.compose.foundation.lazy.LazyListState$scrollToItem$2.invoke</text>
+</g>
+<g >
+<title>androidx.compose.runtime.CompositionImpl.addPendingInvalidationsLocked (81,619,680 ns, 1.65%)</title><rect x="1427.5" y="775" width="29.3" height="15.0" fill="rgb(231,96,96)" rx="2" ry="2" />
+<text  x="1430.48" y="785.5" >a..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.CoroutineScopeKt.coroutineScope (299,748,140 ns, 6.05%)</title><rect x="1048.5" y="695" width="107.7" height="15.0" fill="rgb(222,83,83)" rx="2" ry="2" />
+<text  x="1051.48" y="705.5" >kotlinx.coro..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutModifierNodeCoordinator.placeAt-f8xVGno (452,335,525 ns, 9.13%)</title><rect x="1601.0" y="999" width="162.5" height="15.0" fill="rgb(221,80,80)" rx="2" ry="2" />
+<text  x="1603.96" y="1009.5" >androidx.compose.ui..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListScrollPosition.updateScrollOffset (17,825,823 ns, 0.36%)</title><rect x="1113.9" y="951" width="6.4" height="15.0" fill="rgb(245,115,115)" rx="2" ry="2" />
+<text  x="1116.86" y="961.5" ></text>
+</g>
+<g >
+<title>java.util.HashMap.put (30,142,511 ns, 0.61%)</title><rect x="730.4" y="1367" width="10.8" height="15.0" fill="rgb(203,54,54)" rx="2" ry="2" />
+<text  x="733.38" y="1377.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.intrinsics.UndispatchedKt.startUndispatchedOrReturn (221,061,639 ns, 4.46%)</title><rect x="1072.5" y="775" width="79.4" height="15.0" fill="rgb(246,117,117)" rx="2" ry="2" />
+<text  x="1075.51" y="785.5" >kotlinx...</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutModifierNodeCoordinator.measure-BRTryo0 (1,239,500,076 ns, 25.02%)</title><rect x="437.3" y="1047" width="445.3" height="15.0" fill="rgb(201,52,52)" rx="2" ry="2" />
+<text  x="440.29" y="1057.5" >androidx.compose.ui.node.LayoutModifierNodeCoordinator.m..</text>
+</g>
+<g >
+<title>unknown (18,401,166 ns, 0.37%)</title><rect x="605.7" y="1383" width="6.6" height="15.0" fill="rgb(248,120,120)" rx="2" ry="2" />
+<text  x="608.70" y="1393.5" ></text>
+</g>
+<g >
+<title>android.os.Looper.loopOnce (4,952,246,677 ns, 99.96%)</title><rect x="10.0" y="359" width="1779.3" height="15.0" fill="rgb(244,114,114)" rx="2" ry="2" />
+<text  x="13.00" y="369.5" >android.os.Looper.loopOnce</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutModifierNodeCoordinator.placeAt-f8xVGno (460,204,175 ns, 9.29%)</title><rect x="1598.8" y="903" width="165.4" height="15.0" fill="rgb(221,80,80)" rx="2" ry="2" />
+<text  x="1601.84" y="913.5" >androidx.compose.ui..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListKt$rememberLazyListMeasurePolicy$1$1$measuredItemProvider$1.&lt;init&gt; (6,885,068 ns, 0.14%)</title><rect x="516.4" y="1319" width="2.5" height="15.0" fill="rgb(223,83,83)" rx="2" ry="2" />
+<text  x="519.45" y="1329.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutModifierNodeCoordinator.measure-BRTryo0 (1,160,202,680 ns, 23.42%)</title><rect x="453.2" y="1175" width="416.8" height="15.0" fill="rgb(201,52,52)" rx="2" ry="2" />
+<text  x="456.19" y="1185.5" >androidx.compose.ui.node.LayoutModifierNodeCoordinat..</text>
+</g>
+<g >
+<title>kotlinx.coroutines.EventLoopImplBase.dispatch (12,786,557 ns, 0.26%)</title><rect x="1190.9" y="631" width="4.6" height="15.0" fill="rgb(206,59,59)" rx="2" ry="2" />
+<text  x="1193.87" y="641.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.SnapshotMutableIntStateImpl.getIntValue (7,868,650 ns, 0.16%)</title><rect x="69.7" y="535" width="2.8" height="15.0" fill="rgb(233,99,99)" rx="2" ry="2" />
+<text  x="72.72" y="545.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.NodeCoordinator.setMeasureResult$ui_release (5,901,487 ns, 0.12%)</title><rect x="862.6" y="1255" width="2.1" height="15.0" fill="rgb(216,74,74)" rx="2" ry="2" />
+<text  x="865.62" y="1265.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LookaheadCapablePlaceable$layout$1.placeChildren (494,335,416 ns, 9.98%)</title><rect x="216.3" y="1335" width="177.6" height="15.0" fill="rgb(231,96,96)" rx="2" ry="2" />
+<text  x="219.32" y="1345.5" >androidx.compose.ui.n..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListState.scroll (308,600,372 ns, 6.23%)</title><rect x="1046.0" y="663" width="110.9" height="15.0" fill="rgb(235,101,101)" rx="2" ry="2" />
+<text  x="1049.01" y="673.5" >androidx.com..</text>
+</g>
+<g >
+<title>java.util.Collections$UnmodifiableCollection.isEmpty (10,819,395 ns, 0.22%)</title><rect x="335.8" y="1703" width="3.8" height="15.0" fill="rgb(252,126,126)" rx="2" ry="2" />
+<text  x="338.76" y="1713.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.MeasureAndLayoutDelegate.remeasureAndRelayoutIfNeeded (556,725,623 ns, 11.24%)</title><rect x="1571.3" y="567" width="200.0" height="15.0" fill="rgb(202,53,53)" rx="2" ry="2" />
+<text  x="1574.27" y="577.5" >androidx.compose.ui.node..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotKt.current (7,868,650 ns, 0.16%)</title><rect x="759.2" y="1399" width="2.8" height="15.0" fill="rgb(236,102,102)" rx="2" ry="2" />
+<text  x="762.18" y="1409.5" ></text>
+</g>
+<g >
+<title>android.view.View.invalidate (14,753,720 ns, 0.30%)</title><rect x="1551.7" y="711" width="5.3" height="15.0" fill="rgb(212,68,68)" rx="2" ry="2" />
+<text  x="1554.71" y="721.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.InnerNodeCoordinator.measure-BRTryo0 (1,121,843,012 ns, 22.64%)</title><rect x="461.7" y="1239" width="403.0" height="15.0" fill="rgb(206,59,59)" rx="2" ry="2" />
+<text  x="464.67" y="1249.5" >androidx.compose.ui.node.InnerNodeCoordinator.meas..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.benchmark.test (4,954,213,839 ns, 100.00%)</title><rect x="10.0" y="55" width="1780.0" height="15.0" fill="rgb(207,61,61)" rx="2" ry="2" />
+<text  x="13.00" y="65.5" >androidx.compose.foundation.benchmark.test</text>
+</g>
+<g >
+<title>unknown (11,769,267 ns, 0.24%)</title><rect x="618.7" y="1447" width="4.2" height="15.0" fill="rgb(248,120,120)" rx="2" ry="2" />
+<text  x="621.67" y="1457.5" ></text>
+</g>
+<g >
+<title>kotlinx.coroutines.BuildersKt__BuildersKt.runBlocking (538,806,804 ns, 10.88%)</title><rect x="1002.9" y="551" width="193.6" height="15.0" fill="rgb(202,54,54)" rx="2" ry="2" />
+<text  x="1005.94" y="561.5" >kotlinx.coroutines.Buil..</text>
+</g>
+<g >
+<title>[DEDUPED] ?.plus (13,770,138 ns, 0.28%)</title><rect x="79.6" y="567" width="5.0" height="15.0" fill="rgb(215,72,72)" rx="2" ry="2" />
+<text  x="82.62" y="577.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotStateObserver$sendNotifications$1.invoke (78,686,505 ns, 1.59%)</title><rect x="1528.7" y="615" width="28.3" height="15.0" fill="rgb(212,68,68)" rx="2" ry="2" />
+<text  x="1531.74" y="625.5" >a..</text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LookaheadCapablePlaceable$layout$1.placeChildren (520,892,109 ns, 10.51%)</title><rect x="207.8" y="1095" width="187.2" height="15.0" fill="rgb(231,96,96)" rx="2" ry="2" />
+<text  x="210.84" y="1105.5" >androidx.compose.ui.no..</text>
+</g>
+<g >
+<title>androidx.compose.runtime.BroadcastFrameClock.getHasAwaiters (9,835,813 ns, 0.20%)</title><rect x="59.8" y="567" width="3.6" height="15.0" fill="rgb(214,70,70)" rx="2" ry="2" />
+<text  x="62.83" y="577.5" ></text>
+</g>
+<g >
+<title>androidx.compose.runtime.snapshots.SnapshotKt.advanceGlobalSnapshot (960,395,127 ns, 19.39%)</title><rect x="1213.5" y="551" width="345.1" height="15.0" fill="rgb(244,115,115)" rx="2" ry="2" />
+<text  x="1216.49" y="561.5" >androidx.compose.runtime.snapshots.Snapsho..</text>
+</g>
+<g >
+<title>androidx.compose.foundation.lazy.LazyListMeasureKt.calculateItemsOffsets (27,540,275 ns, 0.56%)</title><rect x="551.8" y="1335" width="9.9" height="15.0" fill="rgb(208,62,62)" rx="2" ry="2" />
+<text  x="554.79" y="1345.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.InnerNodeCoordinator.placeAt-f8xVGno (491,384,673 ns, 9.92%)</title><rect x="217.4" y="1383" width="176.5" height="15.0" fill="rgb(226,88,88)" rx="2" ry="2" />
+<text  x="220.38" y="1393.5" >androidx.compose.ui.n..</text>
+</g>
+<g >
+<title>androidx.compose.ui.platform.AndroidComposeView.onRequestRelayout (44,261,160 ns, 0.89%)</title><rect x="1541.1" y="679" width="15.9" height="15.0" fill="rgb(246,118,118)" rx="2" ry="2" />
+<text  x="1544.11" y="689.5" ></text>
+</g>
+<g >
+<title>androidx.compose.ui.node.LayoutNodeLayoutDelegate$MeasurePassDelegate$placeOuterCoordinatorBlock$1.invoke (549,323,040 ns, 11.09%)</title><rect x="200.8" y="983" width="197.3" height="15.0" fill="rgb(248,119,119)" rx="2" ry="2" />
+<text  x="203.77" y="993.5" >androidx.compose.ui.nod..</text>
+</g>
+<g >
+<title>kotlin.coroutines.CoroutineContext$plus$1.invoke (6,885,069 ns, 0.14%)</title><rect x="82.1" y="599" width="2.5" height="15.0" fill="rgb(225,87,87)" rx="2" ry="2" />
+<text  x="85.09" y="609.5" ></text>
+</g>
+<g >
+<title>kotlin.coroutines.intrinsics.IntrinsicsKt__IntrinsicsJvmKt.createCoroutineUnintercepted (10,819,395 ns, 0.22%)</title><rect x="979.1" y="615" width="3.9" height="15.0" fill="rgb(246,117,117)" rx="2" ry="2" />
+<text  x="982.09" y="625.5" ></text>
+</g>
+</g>
+</svg>

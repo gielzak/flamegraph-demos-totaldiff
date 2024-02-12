@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <title>Diff</title>
+
+    <link
+      href="https://unpkg.com/material-components-web@latest/dist/material-components-web.min.css"
+      rel="stylesheet"
+    />
+    <script src="https://unpkg.com/material-components-web@latest/dist/material-components-web.min.js"></script>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
+  </head>
+  <body>
+    <div>
+      <div>
+        <button class="button" onclick="openTab('before-raw')">base</button>
+        <button class="button" onclick="openTab('before-diff')">base-vs-curr</button>
+        <button class="button" onclick="openTab('after-raw')">curr</button>
+        <button class="button" onclick="openTab('after-diff')">curr-vs-base</button>
+      </div>
+      <div id="before-raw" class="svg">
+        <object type="image/svg+xml" data="before-raw.svg">Failed to display the file: before-raw.svg</object>
+      </div>
+      <div id="before-diff" class="svg">
+        <object type="image/svg+xml" data="before-diff.svg">Failed to display the file: before-diff.svg</object>
+      </div>
+      <div id="after-raw" class="svg">
+        <object type="image/svg+xml" data="after-raw.svg">Failed to display the file: after-raw.svg</object>
+      </div>
+      <div id="after-diff" class="svg">
+        <object type="image/svg+xml" data="after-diff.svg">Failed to display the file: after-diff.svg</object>
+      </div>
+    </div>
+
+    <script>
+      mdc.ripple.MDCRipple.attachTo(document.querySelector(".button"));
+
+      function openTab(tabName) {
+        let tab = document.getElementsByClassName("svg");
+        for (let i = 0; i < tab.length; i++) tab[i].style.display = "none";
+        document.getElementById(tabName).style.display = "block";
+      }
+
+      openTab("after-diff");
+    </script>
+  </body>
+</html>
